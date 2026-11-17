@@ -1,0 +1,173 @@
+name: "ltp-syscalls"
+
+on:
+  push:
+    branches:
+      - 'release-**'
+    paths-ignore:
+      - 'docs/**'
+  pull_request:
+    #The branches below must be a subset of the branches above
+    branches:
+      - 'release-**'
+    paths-ignore:
+      - 'docs/**'
+  schedule:
+    - cron:  '30 20 * * *'
+  workflow_dispatch:
+    inputs:
+      debug:
+        type: boolean
+        description: "Run the build with tmate debugging enabled"
+        required: false
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ltpsyscalls:
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # meta: [ 'sqlite3', 'redis', 'mysql', 'tikv', 'tidb', 'postgres', 'mariadb', 'badger', 'fdb']
+        meta: ['redis']
+        type: [ 'head', 'middle', 'tail']
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 1
+
+      - name: mount coverage dir
+        timeout-minutes: 5
+        uses: ./.github/actions/mount-coverage-dir
+        with:
+          mount_point: cover
+          access_key: ${{ secrets.CI_COVERAGE_AWS_AK }}
+          secret_key: ${{ secrets.CI_COVERAGE_AWS_SK }}
+          token: ${{ secrets.CI_COVERAGE_AWS_TOKEN }}
+
+      - name: Set Variable
+        id: vars
+        run: |
+          if [ "${{matrix.meta}}" == "fdb" ]; then
+            echo "target=juicefs.fdb" >> $GITHUB_OUTPUT
+          else
+            echo "target=juicefs" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build
+        timeout-minutes: 10
+        uses: ./.github/actions/build
+        with: 
+          target: ${{steps.vars.outputs.target}}
+
+      - name: Prepare meta db
+        run: | 
+          chmod +x .github/scripts/start_meta_engine.sh
+          source .github/scripts/start_meta_engine.sh
+          start_meta_engine ${{matrix.meta}}
+          meta_url=$(get_meta_url ${{matrix.meta}})
+          create_database $meta_url
+
+      - name: Copy
+        run: |
+          cp .github/workflows/bash/rm_syscalls /tmp/
+          cp .github/workflows/bash/rm_list.sh /tmp/
+
+      - name: Juicefs Format
+        run: |
+          source .github/scripts/start_meta_engine.sh
+          meta_url=$(get_meta_url ${{matrix.meta}})
+          sudo GOCOVERDIR=$(pwd)/cover ./juicefs format --trash-days 0 $meta_url --bucket=/mnt/jfs pics
+
+      - name: Juicefs Mount
+        run: |
+          source .github/scripts/start_meta_engine.sh
+          meta_url=$(get_meta_url ${{matrix.meta}})
+          sudo GOCOVERDIR=$(pwd)/cover ./juicefs mount --enable-xattr -d $meta_url /tmp/jfs --no-usage-report
+
+      - name: Install LTP Syscalls
+        run: |
+          sudo .github/scripts/apt_install.sh libaio-dev libacl1-dev attr
+          wget -O ltp.tar.xz https://github.com/linux-test-project/ltp/releases/download/20260529/ltp-full-20260529.tar.xz
+          mkdir ltp
+          tar -xvf ltp.tar.xz -C ltp --strip-components 1
+          cd ltp
+          make autotools
+          ./configure
+          make
+          sudo make install
+
+      - name: Run LTP Syscalls
+        timeout-minutes: 60
+        run: |
+          cd /opt/ltp
+          sudo mkdir -p output
+          sudo chmod +x /tmp/rm_list.sh
+          sudo cp runtest/syscalls runtest/syscalls-jfs
+          sudo chmod 777 runtest/syscalls-jfs
+          sudo /tmp/rm_list.sh /tmp/rm_syscalls /opt/ltp/runtest/syscalls-jfs
+          split -a 1 -d -l $(( $(wc -l < /opt/ltp/runtest/syscalls-jfs) / 3 + 1 )) /opt/ltp/runtest/syscalls-jfs /tmp/syscalls_
+          sudo cp /tmp/syscalls_* /opt/ltp/runtest/
+          sudo chmod 777 /tmp/syscalls_* /opt/ltp/runtest/syscalls_*
+          cat >/tmp/ltp.skip <<'EOF'
+          # LTP listmount04 expects listmount() invalid mount-id validation
+          # added in Linux 6.11.
+          # GitHub Actions ubuntu-22.04 currently runs Azure 6.8 kernels
+          # (for example 6.8.0-1044-azure), so listmount04 reports two
+          # kernel/LTP mismatch failures unrelated to JuiceFS.
+          # Remove this skip after the runner kernel is >= 6.11 or LTP carries
+          # the upstream listmount04 minimum-kernel fix.
+          listmount04
+          EOF
+          if [ "${{matrix.type}}" == "head" ]; then
+            cat /tmp/syscalls_0
+            sudo /opt/ltp/kirk --no-colors --run-suite syscalls_0 --skip-file /tmp/ltp.skip --sut default --tmp-dir /tmp/jfs 2>&1 | sudo tee /opt/ltp/output/result0.log
+          elif [ "${{matrix.type}}" == "middle" ]; then
+            cat /tmp/syscalls_1
+            sudo /opt/ltp/kirk --no-colors --run-suite syscalls_1 --skip-file /tmp/ltp.skip --sut default --tmp-dir /tmp/jfs 2>&1 | sudo tee /opt/ltp/output/result1.log
+          elif [ "${{matrix.type}}" == "tail" ]; then
+            cat /tmp/syscalls_2
+            sudo /opt/ltp/kirk --no-colors --run-suite syscalls_2 --skip-file /tmp/ltp.skip --sut default --tmp-dir /tmp/jfs 2>&1 | sudo tee /opt/ltp/output/result2.log
+          else
+            echo "matrix.type: ${{matrix.type}} is not valid" && exit 1
+          fi
+          sudo sh -c "cat /opt/ltp/output/result*.log > /opt/ltp/output/result.log"
+          sudo sh -c "grep -E '^(Broken:|Failures:|    • )' /opt/ltp/output/result.log > /opt/ltp/output/result.log.failed || true"
+          sudo sh -c "grep -i 'skip' /opt/ltp/output/result.log > /opt/ltp/output/result.log.tconf || true"
+
+      - name: tconf Log
+        if: always()
+        run: |
+          cat /opt/ltp/output/result.log.tconf
+
+      - name: check ltpsyscall failed log
+        if: always()
+        run: |
+          cat /opt/ltp/output/result.log.failed
+
+      - name: upload coverage report
+        timeout-minutes: 5
+        continue-on-error: true
+        uses: ./.github/actions/upload-coverage
+        with:
+          UPLOAD_TOKEN: ${{ secrets.CI_COVERAGE_FILE_UPLOAD_AUTH_TOKEN }}
+
+      - name: Send Slack Notification
+        if: failure()
+        uses: juicedata/slack-notify-action@main
+        with:
+          channel-id: "${{ secrets.SLACK_CHANNEL_ID_FOR_JUICEFS_CE_CI_NOTIFY }}"
+          slack_bot_token: "${{ secrets.SLACK_BOT_TOKEN }}"
+          workflow_name: ${{ github.workflow }}
+
+      - name: Setup upterm session
+        if: failure() && (github.event.inputs.debug == 'true' || github.run_attempt != 1)
+        timeout-minutes: 60
+        uses: lhotari/action-upterm@v1

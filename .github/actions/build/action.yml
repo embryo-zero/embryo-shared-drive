@@ -1,0 +1,83 @@
+name: 'Build Action'
+description: 'Build action'
+inputs:
+  target:
+    description: 'build target: juicefs, juicefs.fdb etc'
+    required: true
+    default: 'juicefs'
+  beta:
+    description: 'beta version for the following test'
+    required: false
+runs:
+  using: "composite"
+  steps:
+    - name: Configure fast APT mirror
+      if: runner.os == 'Linux'
+      uses: vegardit/fast-apt-mirror.sh@1.4.5
+
+    - uses: actions/setup-go@v3
+      with:
+        go-version: '1.25.0'
+        cache: true
+
+    - name: Use distro fusermount3
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        fusermount_bin=/usr/bin/fusermount3
+        if [[ ! -x "$fusermount_bin" || ! -u "$fusermount_bin" || "$(stat -c %u "$fusermount_bin")" != "0" ]]; then
+          echo "::error::$fusermount_bin must be an executable setuid-root helper"
+          exit 1
+        fi
+        helper_dir="$RUNNER_TEMP/juicefs-fuse-bin"
+        mkdir -p "$helper_dir"
+        ln -sf "$fusermount_bin" "$helper_dir/fusermount3"
+        echo "$helper_dir" >> "$GITHUB_PATH"
+
+    - name: Allow FUSE unmounts in AppArmor
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        if [[ -f /etc/apparmor.d/fusermount3 ]]; then
+          sudo mkdir -p /etc/apparmor.d/local
+          echo 'umount,' | sudo tee -a /etc/apparmor.d/local/fusermount3 >/dev/null
+          sudo apparmor_parser -r /etc/apparmor.d/fusermount3
+        fi
+
+    - name: Change go version for root user
+      shell: bash
+      run: |
+        go_path=`which go`
+        echo $go_path
+        root_go_path=`sudo which go`
+        echo $root_go_path
+        sudo rm -f $root_go_path
+        sudo ln -s $go_path $root_go_path
+        go version
+        sudo go version
+
+    - name: Install tools
+      shell: bash
+      run: |
+        if [ "${{inputs.target}}" == "juicefs.fdb" ]; then
+          wget -q https://github.com/apple/foundationdb/releases/download/6.3.23/foundationdb-clients_6.3.23-1_amd64.deb
+          sudo dpkg -i foundationdb-clients_6.3.23-1_amd64.deb
+        elif [ "${{inputs.target}}" == "juicefs.gluster" ]; then
+          sudo .github/scripts/apt_install.sh uuid-dev libglusterfs-dev
+        fi
+
+    - name: Build linux target
+      shell: bash
+      run: |
+        if [[ -n "${{ inputs.beta }}" ]]; then
+          echo "use beta version of juicefs: ${{inputs.beta}}"
+          wget -q https://juicefs-com-static.oss-cn-shanghai.aliyuncs.com/juicefs_beta/${{inputs.beta}} -O juicefs
+          chmod +x juicefs
+          ./juicefs version
+        else
+          echo "start to build ${{inputs.target}}"
+          make ${{inputs.target}}.cover
+          [ "${{inputs.target}}" != "juicefs" ] &&  mv ${{inputs.target}} juicefs
+          ./juicefs version
+          echo "build ${{inputs.target}} succeed"
+        fi

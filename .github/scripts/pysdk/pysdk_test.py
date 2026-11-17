@@ -1,0 +1,770 @@
+import errno
+from array import array
+import fractions
+import grp
+import io
+import unittest
+from unittest.mock import patch
+import os
+import pwd
+import stat
+from os.path import dirname
+import sys
+import time
+sys.path.append('.')
+from sdk.python.juicefs.juicefs import juicefs
+from bench import seq_write, random_write, seq_read, random_read
+
+TESTFN='/test'
+TESTFILE='/test/file'
+os.makedirs('/tmp/jfsCache0', exist_ok=True)
+meta_url=os.environ.get('META_URL', 'redis://localhost')
+
+
+class FileTests(unittest.TestCase):
+    def open_client(self):
+        return juicefs.Client("test-volume", meta=meta_url, access_log="/tmp/access.log")
+
+    def setUp(self):
+        self.v = self.open_client()
+        if not self.v.exists(TESTFN):
+            self.v.mkdir(TESTFN)
+
+    def tearDown(self):
+        self.v.rmr(TESTFN)
+
+    def create_file(self, filename, content=b'content'):
+        with self.v.open(filename, "xb", 0) as fp:
+            fp.write(content)
+
+    def test_read(self):
+        with self.v.open(TESTFILE, "w+b") as fobj:
+            fobj.write(b"spam")
+            fobj.flush()
+            fd = fobj.fileno()
+            fobj.seek(0,0)
+            s = fobj.read(4)
+            self.assertEqual(type(s), bytes)
+            self.assertEqual(s, b"spam")
+
+    def test_write(self):
+        fd = self.v.open(TESTFILE, 'wb')
+        self.assertRaises(TypeError, os.write, fd, "beans")
+        fd.write(b"bacon\n")
+        fd.close()
+        with self.v.open(TESTFILE, "rb") as fobj:
+            self.assertEqual(fobj.read().splitlines(), [b"bacon"])
+
+
+class ReadintoTests(FileTests):
+    def test_readinto_writable_buffers(self):
+        content = b"abcdefghijk"
+        self.create_file(TESTFILE, content)
+        buffers = [
+            lambda: bytearray(8),
+            lambda: bytearray(),
+            lambda: array('I', [0, 0]),
+            lambda: memoryview(array('I', [0, 0])),
+            lambda: memoryview(bytearray(8)).cast('B', (2, 4)),
+            lambda: memoryview(bytearray(12))[2:10],
+        ]
+        for make_buffer in buffers:
+            with self.subTest(buffer=make_buffer()):
+                actual = make_buffer()
+                expected = make_buffer()
+                reference = io.BytesIO(content)
+                with self.v.open(TESTFILE, 'rb', 0) as stream:
+                    for _ in range(3):
+                        self.assertEqual(stream.readinto(actual), reference.readinto(expected))
+                        self.assertEqual(memoryview(actual).tobytes(), memoryview(expected).tobytes())
+                        self.assertEqual(stream.tell(), reference.tell())
+
+    def test_readinto_invalid_buffer_preserves_position(self):
+        content = b"abcdefghijk"
+        self.create_file(TESTFILE, content)
+        for position in (2, len(content)):
+            for buffer in (b"1234", b"", memoryview(b"1234"),
+                           memoryview(bytearray(8))[::2], [0, 0, 0, 0]):
+                with self.subTest(position=position, buffer=buffer):
+                    with self.v.open(TESTFILE, 'rb', 0) as stream:
+                        stream.seek(position)
+                        with self.assertRaises(TypeError):
+                            stream.readinto(buffer)
+                        self.assertEqual(stream.tell(), position)
+                        self.assertEqual(stream.read(), content[position:])
+
+
+class SeekTests(FileTests):
+    def test_seek_invalid_position_preserves_stream(self):
+        content = b'abcdef'
+        self.create_file(TESTFILE, content)
+        for buffering in (0, 8):
+            for offset, whence in ((-1, os.SEEK_SET), (-3, os.SEEK_CUR), (-7, os.SEEK_END)):
+                with self.subTest(buffering=buffering, offset=offset, whence=whence):
+                    with self.v.open(TESTFILE, 'r+b', buffering) as stream:
+                        stream.seek(2)
+                        with self.assertRaises(OSError):
+                            stream.seek(offset, whence)
+                        self.assertEqual(stream.tell(), 2)
+                        self.assertEqual(stream.read(1), b'c')
+
+    def test_seek_overflow_does_not_wrap_native_offset(self):
+        self.create_file(TESTFILE, b'abcdef')
+        with self.v.open(TESTFILE, 'r+b', 0) as stream:
+            stream.seek(2)
+            for offset, whence in (((1 << 64), os.SEEK_SET),
+                                   ((1 << 63), os.SEEK_SET),
+                                   (-(1 << 63) - 1, os.SEEK_SET),
+                                   ((1 << 63) - 1, os.SEEK_CUR),
+                                   ((1 << 63) - 1, os.SEEK_END)):
+                with self.subTest(offset=offset, whence=whence):
+                    with self.assertRaises(OverflowError):
+                        stream.seek(offset, whence)
+                    self.assertEqual(stream.tell(), 2)
+            stream.write(b'Z')
+            stream.seek(0)
+            self.assertEqual(stream.read(), b'abZdef')
+
+    def test_seek_requires_integer_arguments(self):
+        class Index:
+            def __index__(self):
+                return 1
+
+        self.create_file(TESTFILE, b'abcdef')
+        with self.v.open(TESTFILE, 'rb', 0) as stream:
+            stream.seek(2)
+            for offset, whence in ((1.5, 0), (1, 0.0), (1, 3)):
+                with self.subTest(offset=offset, whence=whence):
+                    with self.assertRaises((TypeError, ValueError)):
+                        stream.seek(offset, whence)
+                    self.assertEqual(stream.tell(), 2)
+            self.assertEqual(stream.seek(Index(), Index()), 3)
+            self.assertEqual(stream.read(1), b'd')
+            self.assertEqual(stream.seek(-1, os.SEEK_END), 5)
+            self.assertEqual(stream.read(), b'f')
+
+
+class TruncateTests(FileTests):
+    def test_truncate_invalid_size_preserves_data(self):
+        content = b'abcdef'
+        cases = ((-1, OSError), (1 << 63, OverflowError),
+                 (1 << 64, OverflowError), ((1 << 64) + 3, OverflowError),
+                 (-(1 << 64) + 3, OverflowError), (1.5, TypeError), ('3', TypeError))
+        for buffering in (None, 0, 8):
+            for index, (size, error) in enumerate(cases):
+                with self.subTest(buffering=buffering, size=size):
+                    path = f'{TESTFILE}-{buffering}-{index}'
+                    self.create_file(path, content)
+                    if buffering is None:
+                        with self.assertRaises(error) as raised:
+                            self.v.truncate(path, size)
+                    else:
+                        with self.v.open(path, 'r+b', buffering) as stream:
+                            stream.seek(2)
+                            with self.assertRaises(error) as raised:
+                                stream.truncate(size)
+                            self.assertEqual(stream.tell(), 2)
+                    if size == -1:
+                        self.assertEqual(raised.exception.errno, errno.EINVAL)
+                    with self.v.open(path, 'rb', 0) as stream:
+                        self.assertEqual(stream.read(), content)
+
+    def test_truncate_valid_sizes(self):
+        class Index:
+            def __index__(self):
+                return 3
+
+        for buffering in (0, 8):
+            with self.subTest(buffering=buffering):
+                path = f'{TESTFILE}-{buffering}'
+                self.create_file(path, b'abcdef')
+                with self.v.open(path, 'r+b', buffering) as stream:
+                    stream.seek(2)
+                    self.assertEqual(stream.truncate(Index()), 3)
+                    self.assertEqual(stream.tell(), 2)
+                    self.assertEqual(stream.truncate(), 2)
+                    self.assertEqual(stream.tell(), 2)
+                self.v.truncate(path, Index())
+                with self.v.open(path, 'rb', 0) as stream:
+                    self.assertEqual(stream.read(), b'ab\x00')
+                self.v.truncate(path, False)
+                self.assertEqual(self.v.stat(path).st_size, 0)
+
+
+class UtimeTests(FileTests):
+    def setUp(self):
+        super().setUp()
+        self.fname = os.path.join(TESTFN, "f1")
+        if not self.v.exists(self.fname):
+            self.create_file(self.fname)
+
+    def _test_utime(self, set_time, filename=None):
+        if not filename:
+            filename = self.fname
+        atime = 1.0   # 1.0 seconds
+        mtime = 4.0   # 4.0 seconds
+        set_time(filename, (atime, mtime))
+        st = self.v.stat(filename)
+        self.assertEqual(st.st_atime, atime)
+        self.assertEqual(st.st_mtime, mtime)
+
+    def test_utime(self):
+        def set_time(filename, times):
+            self.v.utime(filename, times)
+        self._test_utime(set_time)
+
+    def test_utime_by_times(self):
+        self.test_utime()
+
+
+class MakedirTests(FileTests):
+    def test_makedir(self):
+        base = TESTFN
+        path = os.path.join(base, 'dir1', 'dir2', 'dir3')
+        self.v.makedirs(path)             # Should work
+        path = os.path.join(base, 'dir1', 'dir2', 'dir3', 'dir4')
+        self.v.makedirs(path)
+        self.assertRaises(OSError, self.v.makedirs, os.curdir)
+        path = os.path.join(base, 'dir1', 'dir2', 'dir3', 'dir4', 'dir5', os.curdir)
+        path = os.path.join(base, 'dir1', os.curdir, 'dir2', 'dir3', 'dir4',
+                            'dir5', 'dir6')
+        self.v.makedirs(path)
+
+
+class ChownFileTests(FileTests):
+    def test_root_group_read_permissions(self):
+        self.v.chmod(TESTFN, 0o755)
+        self.create_file(TESTFILE)
+        users = {0: pwd.struct_passwd(("root", "x", 0, 0, "", "/", "")),
+                 1001: pwd.struct_passwd(("sdk-member", "x", 1001, 1001, "", "/", ""))}
+        groups = {gid: grp.struct_group((name, "x", gid, []))
+                  for gid, name in [(0, "root"), (1, "adm"), (1001, "sdk-members")]}
+        # Legacy hash of "root" on "test-volume"; SQL engines use a 31-bit GID.
+        legacy_gid = 2730912965
+        if meta_url.startswith(("sqlite3://", "mysql://", "postgres://")):
+            legacy_gid &= 0x7fffffff
+        for root_groups, file_gid, denied_mode in [([0], 0, 0o400), ([0, 1], legacy_gid, 0o404)]:
+            with self.subTest(root_groups=root_groups):
+                self.v.chown(TESTFILE, 0, file_gid)
+                self.v.chmod(TESTFILE, denied_mode)
+                memberships = {"root": root_groups, "sdk-member": [1001, 0]}
+                with patch.object(os, "geteuid", return_value=1001), \
+                        patch.object(pwd, "getpwuid", side_effect=users.__getitem__), \
+                        patch.object(grp, "getgrgid", side_effect=groups.__getitem__), \
+                        patch.object(os, "getgrouplist", side_effect=lambda name, gid: memberships[name]):
+                    member = self.open_client()
+                self.addCleanup(member.close)
+                with self.assertRaises(OSError) as denied:
+                    with member.open(TESTFILE, "rb") as f:
+                        f.read()
+                self.assertEqual(denied.exception.errno, errno.EACCES)
+
+                self.v.chmod(TESTFILE, 0o440)
+                with member.open(TESTFILE, "rb") as f:
+                    self.assertEqual(f.read(), b"content")
+
+    def test_chown_uid_gid_arguments_must_be_index(self):
+        stat = self.v.stat(TESTFN)
+        uid = stat.st_uid
+        gid = stat.st_gid
+        for value in (-1.0, -1j, fractions.Fraction(-2, 2)):
+            self.assertRaises(TypeError, self.v.chown, TESTFN, value, gid)
+            self.assertRaises(TypeError, self.v.chown, TESTFN, uid, value)
+        self.assertIsNone(self.v.chown(TESTFN, uid, gid))
+
+    def test_chown_with_root(self):
+        try:
+            all_users = [u.pw_uid for u in pwd.getpwall()]
+        except (AttributeError):
+            all_users = []
+        uid_1, uid_2 = all_users[:2]
+        gid = self.v.stat(TESTFN).st_gid
+        self.v.chown(TESTFN, uid_1, gid)
+        uid = self.v.stat(TESTFN).st_uid
+        self.assertEqual(uid, uid_1)
+        self.v.chown(TESTFN, uid_2, gid)
+        uid = self.v.stat(TESTFN).st_uid
+        self.assertEqual(uid, uid_2)
+
+
+class LinkTests(FileTests):
+    def setUp(self):
+        super().setUp()
+        self.file1 = os.path.join(TESTFN, "1")
+        self.file2 = os.path.join(TESTFN, "2")
+
+    def are_files_same(self, file1, file2):
+        stat1 = self.v.lstat(file1)
+        stat2 = self.v.lstat(file2)
+        return stat1.st_ino  == stat2.st_ino and stat1.st_dev == stat2.st_dev
+
+    def _test_link(self, file1, file2):
+        self.create_file(file1)
+
+        try:
+            self.v.link(file1, file2)
+        except PermissionError as e:
+            self.skipTest('os.link(): %s' % e)
+        self.assertTrue(self.are_files_same(file1, file2))
+
+    def test_link(self):
+        self._test_link(self.file1, self.file2)
+
+
+class SummaryTests(FileTests):
+    # /test/dir1/file
+    #      /dir2
+    #      /file
+    def setUp(self):
+        super().setUp()
+        self.create_file(TESTFILE)
+        self.v.mkdir(TESTFN + '/dir1')
+        self.create_file(TESTFN + '/dir1/file')
+        self.v.mkdir(TESTFN + '/dir2')
+
+    def test_summary(self):
+        res = self.v.summary(TESTFILE, depth=258, entries=2)
+        self.assertTrue(normalize(res)==normalize({"Path": "file", "Type": 2, "Files":1, "Dirs":0, "Size":4096}))
+        res = self.v.summary(TESTFN)
+        self.assertTrue(normalize(res)==normalize({"Path": "test", "Type": 2, "Files":2, "Dirs":3, "Size":20480}))
+        res = self.v.summary(TESTFN, depth=257, entries=1)
+        self.assertTrue(normalize(res)==normalize({"Path": "test", "Type": 2, "Files":2, "Dirs":3, "Size":20480, "Children":[
+            {"Path": "dir1", "Type": 2, "Files":1, "Dirs":1, "Size":8192},{'Path': '...', 'Type': 1, 'Size': 8192, 'Files': 1, 'Dirs': 1}]}))
+        res = self.v.summary(TESTFN, depth=258, entries=1)
+        self.assertTrue(normalize(res)==normalize(
+            {
+                "Path": "test", "Type": 2, "Files":2, "Dirs":3, "Size":20480, "Children":
+                [
+                    {"Path": "dir1", "Type": 2, "Files":1, "Dirs":1, "Size":8192, "Children": [
+                        {"Path": "dir1/file", "Type": 1, "Size": 4096, "Files": 1, "Dirs": 0}
+                    ]
+                     },{'Path': '...', 'Type': 1, 'Size': 8192, 'Files': 1, 'Dirs': 1}
+                ]}
+        ))
+        res = self.v.summary(TESTFN, depth=259, entries=4)
+        self.assertTrue(normalize(res)==normalize(
+            {
+                "Path": "test", "Type": 2, "Files":2, "Dirs":3, "Size":20480, "Children":
+                [
+                    {
+                        "Path": "dir1", "Type": 2, "Files":1, "Dirs":1, "Size":8192, "Children":
+                        [{"Path": "dir1/file", "Type": 1, "Size": 4096, "Files": 1, "Dirs": 0}]
+                    },{
+                    'Path': 'file', 'Type': 1, 'Size': 4096, 'Files': 1, 'Dirs': 0
+                },{
+                    'Path': 'dir2', 'Type': 2, 'Size': 4096, 'Files': 0, 'Dirs': 1
+                }
+                ]}
+        ))
+
+
+class QuotaTests(FileTests):
+    def test_quota(self):
+        # /test/dir1/file
+        #      /dir2
+        #      /file
+        self.create_file(TESTFILE)
+        self.v.mkdir(TESTFN + '/dir1')
+        self.create_file(TESTFN + '/dir1/file')
+        self.v.mkdir(TESTFN + '/dir2')
+
+        # set quota
+        self.v.set_quota(path=TESTFN, capacity=1024*1024*1024, inodes=1000, create=True, strict=True)
+        res = self.v.get_quota(path=TESTFN)
+        self.assertTrue(normalize(res)==normalize({"/test": {"MaxSpace": 1024*1024*1024, "MaxInodes": 1000, "UsedSpace": 16384, "UsedInodes": 4}}))
+
+        res = self.v.list_quota()
+        self.assertTrue(normalize(res)==normalize({"/test": {"MaxSpace": 1024*1024*1024, "MaxInodes": 1000, "UsedSpace": 16384, "UsedInodes": 4}}))
+
+        self.v.set_quota(path=TESTFN+"/dir1",  capacity=1024*1024*1024, inodes=10000, create=True, strict=True)
+        res = self.v.list_quota()
+        self.assertTrue(normalize(res)==normalize({"/test": {"MaxSpace": 1024*1024*1024, "MaxInodes": 1000, "UsedSpace": 16384, "UsedInodes": 4}, "/test/dir1": {"MaxSpace": 1024*1024*1024, "MaxInodes": 10000, "UsedSpace": 4096, "UsedInodes": 1}}))
+
+        # check quota
+        self.v.check_quota(path=TESTFN, strict=True, repair=True)
+
+        # unset quota
+        self.v.del_quota(path=TESTFN)
+        res = self.v.get_quota(path=TESTFN)
+        self.assertTrue(res=={})
+
+
+def normalize(d):
+    if isinstance(d, dict):
+        if "Children" in d:
+            d["Children"].sort(key=lambda x: x["Path"])
+        return {k: normalize(v) for k, v in d.items()}
+    elif isinstance(d, list):
+        return sorted((normalize(x) for x in d), key=lambda x: x.get("Path", ""))
+    else:
+        return d
+
+
+class NonLocalSymlinkTests(FileTests):
+    def test_directory_link_nonlocal(self):
+        src = os.path.join(TESTFN, 'some_link')
+        self.v.symlink('/some_dir', src)
+        assert self.v.readlink(src) == '../some_dir'
+
+
+class ListdirTests(FileTests):
+    def test_listdir_empty(self):
+        d = os.path.join(TESTFN, 'empty_dir')
+        self.v.mkdir(d)
+        self.assertEqual(self.v.listdir(d), [])
+        self.assertEqual(self.v.listdir(d, detail=True), [])
+
+    def test_listdir_names(self):
+        d = os.path.join(TESTFN, 'names_dir')
+        self.v.mkdir(d)
+        names = ['a', 'b' * 200, 'with space', '中文名字']
+        for n in names:
+            self.create_file(os.path.join(d, n))
+        self.v.mkdir(os.path.join(d, 'subdir'))
+        self.assertEqual(sorted(self.v.listdir(d)), sorted(names + ['subdir']))
+
+    def test_listdir_detail(self):
+        d = os.path.join(TESTFN, 'detail_dir')
+        self.v.mkdir(d)
+        self.create_file(os.path.join(d, 'f'), b'0123456789')
+        self.v.mkdir(os.path.join(d, 'sub'))
+        infos = dict(self.v.listdir(d, detail=True))
+        self.assertEqual(sorted(infos), ['f', 'sub'])
+        self.assertTrue(stat.S_ISREG(infos['f'].st_mode))
+        self.assertEqual(infos['f'].st_size, 10)
+        self.assertTrue(stat.S_ISDIR(infos['sub'].st_mode))
+
+    def test_listdir_many(self):
+        d = os.path.join(TESTFN, 'many_dir')
+        self.v.mkdir(d)
+        names = ['file_%03d' % i for i in range(200)]
+        for n in names:
+            self.create_file(os.path.join(d, n))
+        self.assertEqual(sorted(self.v.listdir(d)), sorted(names))
+        infos = self.v.listdir(d, detail=True)
+        self.assertEqual(sorted(n for n, _ in infos), sorted(names))
+
+
+class ExtendedAttributeTests(FileTests):
+    def _check_xattrs_str(self, s, getxattr, setxattr, removexattr, listxattr, **kwargs):
+        fn = TESTFN + '_xattr'
+        if self.v.exists(fn):
+            self.v.unlink(fn)
+        self.create_file(fn)
+
+        #        with self.assertRaises(OSError) as cm:
+        #            self.v.getxattr(fn, s("user.test"), **kwargs)
+        #        self.assertEqual(cm.exception.errno, errno.ENODATA)
+
+        init_xattr = self.v.listxattr(fn)
+        self.assertIsInstance(init_xattr, list)
+
+        self.v.setxattr(fn, s("user.test"), b"a", **kwargs)
+        xattr = set(init_xattr)
+        xattr.add("user.test")
+        self.assertEqual(set(self.v.listxattr(fn)), xattr)
+        self.assertEqual(self.v.getxattr(fn, b"user.test", **kwargs), b"a")
+        self.v.setxattr(fn, s("user.test"), b"hello", os.XATTR_REPLACE, **kwargs)
+        self.assertEqual(self.v.getxattr(fn, b"user.test", **kwargs), b"hello")
+
+        with self.assertRaises(OSError) as cm:
+            self.v.setxattr(fn, s("user.test"), b"bye", os.XATTR_CREATE, **kwargs)
+        self.assertEqual(cm.exception.errno, errno.EEXIST)
+
+        #        with self.assertRaises(OSError) as cm:
+        #            self.v.setxattr(fn, s("user.test2"), b"bye", os.XATTR_REPLACE, **kwargs)
+        #        self.assertEqual(cm.exception.errno, errno.ENODATA)
+
+        self.v.setxattr(fn, s("user.test2"), b"foo", os.XATTR_CREATE, **kwargs)
+        xattr.add("user.test2")
+        self.assertEqual(set(self.v.listxattr(fn)), xattr)
+        self.v.removexattr(fn, s("user.test"), **kwargs)
+
+        with self.assertRaises(OSError) as cm:
+            self.v.getxattr(fn, s("user.test"), **kwargs)
+        self.assertEqual(cm.exception.errno, errno.ENODATA)
+
+        xattr.remove("user.test")
+        self.assertEqual(set(self.v.listxattr(fn)), xattr)
+        self.assertEqual(self.v.getxattr(fn, s("user.test2"), **kwargs), b"foo")
+        self.v.setxattr(fn, s("user.test"), b"a"*1024, **kwargs)
+        self.assertEqual(self.v.getxattr(fn, s("user.test"), **kwargs), b"a"*1024)
+        self.v.removexattr(fn, s("user.test"), **kwargs)
+        many = sorted("user.test{}".format(i) for i in range(100))
+        for thing in many:
+            self.v.setxattr(fn, thing, b"x", **kwargs)
+        self.assertEqual(set(self.v.listxattr(fn)), set(init_xattr) | set(many))
+
+    def _check_xattrs(self, *args, **kwargs):
+        self._check_xattrs_str(str, *args, **kwargs)
+        self.v.unlink(TESTFN + '_xattr')
+
+        self._check_xattrs_str(os.fsencode, *args, **kwargs)
+        self.v.unlink(TESTFN + '_xattr')
+
+    def test_simple(self):
+        self._check_xattrs(self.v.getxattr, self.v.setxattr, self.v.removexattr,
+                           self.v.listxattr)
+
+    def test_fds(self):
+        def getxattr(path, *args):
+            with self.v.open(path, "rb") as fp:
+                return self.v.getxattr(fp.fileno(), *args)
+        def setxattr(path, *args):
+            with self.v.open(path, "wb", 0) as fp:
+                self.v.setxattr(fp.fileno(), *args)
+        def removexattr(path, *args):
+            with self.v.open(path, "wb", 0) as fp:
+                self.v.removexattr(fp.fileno(), *args)
+        def listxattr(path, *args):
+            with self.v.open(path, "rb") as fp:
+                return self.v.listxattr(fp.fileno(), *args)
+        self._check_xattrs(getxattr, setxattr, removexattr, listxattr)
+
+
+class BenchTests(FileTests):
+    test_file = TESTFILE + '_bench'
+    block_size = 128 * 1024  # 128KB
+    buffer_size = 300
+    buffering = 2 * 1024 * 1024
+    run_time = 30
+    file_size = 100 * 1024 * 1024
+    seed = 20
+    count = 200
+
+    def test_seq_write(self):
+        print('test_seq_write')
+        seq_write(
+            filename=self.test_file,
+            client=self.v,
+            protocol='pysdk',
+            block_size=self.block_size,
+            buffering=self.buffering,
+            run_time=self.run_time,
+            file_size=self.file_size
+        )
+        self.assertTrue(self.v.exists(self.test_file))
+        stat = self.v.stat(self.test_file)
+        self.assertGreater(stat.st_size, 0)
+
+    def test_random_write(self):
+        print('test_random_write')
+        random_write(
+            filename=self.test_file,
+            client=self.v,
+            protocol='pysdk',
+            buffering=self.buffering,
+            block_size=self.block_size,
+            run_time=self.run_time,
+            file_size=self.file_size,
+            seed=self.seed
+        )
+        self.assertTrue(self.v.exists(self.test_file))
+        stat = self.v.stat(self.test_file)
+        self.assertGreater(stat.st_size, 0)
+
+    def test_seq_read(self):
+        print('test_seq_read')
+        with self.v.open(self.test_file, 'wb') as f:
+            f.write(os.urandom(self.file_size))
+
+        seq_read(
+            filename=self.test_file,
+            client=self.v,
+            protocol='pysdk',
+            block_size=self.block_size,
+            buffering=self.buffering
+        )
+
+    def test_random_read(self):
+        print('test_random_read')
+        with self.v.open(self.test_file, 'wb') as f:
+            f.write(os.urandom(self.file_size))
+
+        random_read(
+            filename=self.test_file,
+            client=self.v,
+            protocol='pysdk',
+            buffering=self.buffering,
+            block_size=self.block_size,
+            seed=self.seed,
+            count=self.count
+        )
+
+
+class ClientParamsTests(FileTests):
+    testfile = TESTFN + '/testfile'
+
+    def test_readonly_param(self):
+        v = juicefs.Client(
+            "test-volume-ro",
+            meta=meta_url,
+            read_only=True
+        )
+        with self.assertRaises(OSError):
+            v.open(self.testfile, 'w')
+
+    def test_cache_params(self):
+        v = juicefs.Client(
+            "test-volume-cache",
+            meta=meta_url,
+            cache_dir="/tmp/jfs_test_cache",
+            cache_size="100M",
+            cache_partial_only=False
+        )
+
+        size_mb = 48
+        test_data = os.urandom(size_mb * 1024 * 1024)
+        with v.open(self.testfile, 'wb') as f:
+            f.write(test_data)
+
+        with v.open(self.testfile, 'rb') as f:
+            read_data = f.read()
+        self.assertEqual(read_data, test_data)
+
+        cache_dir = "/tmp/jfs_test_cache"
+        cache_size = 0
+        for root, dirs, files in os.walk(cache_dir):
+            for file in files:
+                if file.endswith('.tmp'):
+                    continue
+                path = os.path.join(root, file)
+                try:
+                    cache_size += os.path.getsize(path)
+                except FileNotFoundError:
+                    continue
+        self.assertGreaterEqual(cache_size, size_mb * 1024 * 1024/2)
+
+    def test_io_limits(self):
+        v = juicefs.Client(
+            "test-volume-limited",
+            meta=meta_url,
+            upload_limit="1M",
+            download_limit="1M"
+        )
+
+        test_data = b"x" * (10 * 1024 * 1024)  # 10MB
+        start_time = time.time()
+        with v.open(self.testfile, 'wb') as f:
+            f.write(test_data)
+        write_time = time.time() - start_time
+
+        self.assertGreaterEqual(write_time, 10.0)
+
+
+class CloneTests(FileTests):
+    def setUp(self):
+        super().setUp()
+        self.source = TESTFN + '/source'
+        self.target = TESTFN + '/target'
+        self.test_data = b"Hello JuiceFS!" * 1024
+
+        with self.v.open(self.source, 'wb') as f:
+            f.write(self.test_data)
+
+    def test_basic_clone(self):
+        self.v.clone(self.source, self.target)
+
+        self.assertTrue(self.v.exists(self.target))
+
+        with self.v.open(self.target, 'rb') as f:
+            cloned_data = f.read()
+        self.assertEqual(cloned_data, self.test_data)
+
+        source_stat = self.v.stat(self.source)
+        target_stat = self.v.stat(self.target)
+        self.assertEqual(source_stat.st_size, target_stat.st_size)
+
+    def test_clone_with_preserve(self):
+        self.v.chmod(self.source, 0o644)
+
+        self.v.clone(self.source, self.target, preserve=True)
+        source_stat = self.v.stat(self.source)
+        target_stat = self.v.stat(self.target)
+        self.assertEqual(source_stat.st_mode, target_stat.st_mode)
+
+
+class WarmupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(self):
+        self.v = juicefs.Client(
+            "test-warmup",
+            meta=meta_url,
+            cache_dir="/tmp/jfs_test_warmup",
+            cache_size="1000M",
+            cache_partial_only=True
+        )
+        if self.v.exists(TESTFN):
+            self.v.rmr(TESTFN)
+        self.v.mkdir(TESTFN)
+        self.test_files = [
+            TESTFN + '/file1',
+            TESTFN + '/file2'
+        ]
+        size_mb = 50
+        test_data = os.urandom(size_mb * 1024 * 1024)
+        for file in self.test_files:
+            with self.v.open(file, 'wb') as f:
+                f.write(test_data)
+
+    @classmethod
+    def tearDownClass(self):
+        if self.v.exists(TESTFN):
+            self.v.warmup(self.test_files, isEvict=True)
+            self.v.rmr(TESTFN)
+
+    def test_basic_warmup(self):
+        result = self.v.warmup(self.test_files, numthreads=4)
+        self.assertIn('FileCount', result)
+        self.assertEqual(result['FileCount'], 2)
+        self.assertIn('SliceCount', result)
+        self.assertIn('TotalBytes', result)
+        self.assertIn('MissBytes', result)
+        #        self.assertIn('Locations', result)
+        cache_dir = "/tmp/jfs_test_warmup"
+        size_mb = 100
+        cache_size = 0
+        time.sleep(2)
+        for root, dirs, files in os.walk(cache_dir):
+            for file in files:
+                cache_size += os.path.getsize(os.path.join(root, file))
+        self.assertGreaterEqual(cache_size, size_mb * 1024 * 1024)
+
+    def test_warmup_check(self):
+        self.v.warmup(self.test_files)
+        result = self.v.warmup(self.test_files, isCheck=True)
+        self.assertEqual(result['MissBytes'], 0)
+        self.assertTrue(any('jfs_test_warmup' in path for path in result['Locations']),
+                        msg=f"'jfs_test_warmup' not found in {result['Locations']}")
+
+    def test_warmup_evict(self):
+        self.v.warmup(self.test_files)
+        result = self.v.warmup(self.test_files, isEvict=True)
+        time.sleep(2)
+        cache_dir = "/tmp/jfs_test_warmup"
+        size_mb = 1
+        cache_size = 0
+        for root, dirs, files in os.walk(cache_dir):
+            for file in files:
+                cache_size += os.path.getsize(os.path.join(root, file))
+        self.assertLessEqual(cache_size, size_mb * 1024 * 1024)
+        result = self.v.warmup(self.test_files, isCheck=True)
+        self.assertEqual(result['MissBytes'], result['TotalBytes'])
+
+
+class InfoTests(FileTests):
+    def test_file_info(self):
+        self.test_dir = TESTFN + '/infotest'
+        self.test_file = self.test_dir + '/testfile'
+        self.v.makedirs(self.test_dir)
+        with self.v.open(self.test_file, 'w') as f:
+            f.write("test content")
+
+        info = self.v.info(self.test_dir,recursive=True,strict=True)
+        self.assertIn('Length', info)
+        self.assertEqual(info['Files'], 1)
+        self.assertEqual(info['Dirs'], 1)
+
+
+if __name__ == '__main__':
+    unittest.main()

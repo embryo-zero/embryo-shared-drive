@@ -1,0 +1,1713 @@
+/*
+ * JuiceFS, Copyright 2018 Juicedata, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package object
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
+	"github.com/baidubce/bce-sdk-go/services/bos/api"
+	"github.com/huaweicloud/huaweicloud-sdk-go-obs/obs"
+
+	"github.com/colinmarc/hdfs/v2/hadoopconf"
+	"github.com/juicedata/juicefs/pkg/utils"
+
+	blob2 "github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+
+	"github.com/volcengine/ve-tos-golang-sdk/v2/tos/enum"
+
+	"github.com/redis/go-redis/v9"
+)
+
+func get(s ObjectStorage, k string, off, limit int64, getters ...AttrGetter) (string, error) {
+	r, err := s.Get(context.Background(), k, off, limit, getters...)
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func TestTierStorageInitTiersIsolatesRuntimeState(t *testing.T) {
+	init := Tiers{
+		0: {
+			ID:  0,
+			Sc:  "STANDARD",
+			Tag: "owner=team a",
+		},
+	}
+	original := init[0]
+
+	storage := &tierStorage{}
+	if err := storage.InitTiers(init); err != nil {
+		t.Fatalf("InitTiers failed: %v", err)
+	}
+
+	if got := init[0]; got != original {
+		t.Fatalf("InitTiers mutated input: got %+v, want %+v", got, original)
+	}
+	if got := storage.tiers[0].encodedTag; got != "owner=team+a" {
+		t.Fatalf("unexpected encoded tag: got %q, want %q", got, "owner=team+a")
+	}
+
+	init[0] = Tier{ID: 0, Sc: "STANDARD", Tag: "owner=changed"}
+	if got := storage.GetTier(context.Background()); got != original {
+		t.Fatalf("tier storage shares input map: got %+v, want %+v", got, original)
+	}
+}
+
+func listAll(ctx context.Context, s ObjectStorage, prefix, marker string, limit int64, followLink bool) ([]Object, error) {
+	ch, err := ListAll(ctx, s, prefix, marker, followLink, true)
+	if err == nil {
+		objs := make([]Object, 0)
+		for obj := range ch {
+			if len(objs) < int(limit) {
+				objs = append(objs, obj)
+			}
+		}
+		return objs, nil
+	}
+	return nil, err
+}
+
+func setStorageClass(o ObjectStorage) string {
+	sc := getScStr(o)
+	if os, ok := o.(SupportTier); ok {
+		tiers := NewTiers(sc)
+		tiers[1] = Tier{ID: 1, Sc: sc}
+		if err := os.InitTiers(tiers); err != nil {
+			logger.Warnf("Set storage tier: %s", err)
+		}
+	}
+	return sc
+}
+
+func getScStr(o ObjectStorage) string {
+	var sc = ""
+	switch o.(type) {
+	case *s3client:
+		sc = "STANDARD_IA"
+	case *wasb:
+		sc = string(blob2.AccessTierCool)
+	case *gs:
+		sc = "NEARLINE"
+	case *ossClient:
+		sc = string(oss.StorageClassIA)
+	case *tosClient:
+		sc = string(enum.StorageClassIa)
+	case *obsClient:
+		sc = string(obs.StorageClassStandard)
+	case *bosclient:
+		sc = api.STORAGE_CLASS_STANDARD
+	case *minio:
+		sc = "REDUCED_REDUNDANCY"
+	case *scw:
+		sc = "ONEZONE_IA" // STANDARD, ONEZONE_IA, GLACIER
+	}
+	return sc
+}
+
+// nolint:errcheck
+func testStorage(t *testing.T, s ObjectStorage) {
+	ctx := context.Background()
+	sc := setStorageClass(s)
+	if err := s.Create(ctx); err != nil {
+		t.Fatalf("Can't create bucket %s: %s", s, err)
+	}
+	if err := s.Create(ctx); err != nil {
+		t.Fatalf("err should be nil when creating a bucket with the same name")
+	}
+	t.Run("list-prefix-boundary", func(t *testing.T) {
+		testListPrefixBoundary(t, s)
+	})
+	prefix := "unit-test/"
+	s = WithPrefix(s, prefix)
+	defer s.Delete(ctx, "") // the prefix directory on file systems
+	defer func() {
+		if err := s.Delete(ctx, "test"); err != nil {
+			t.Fatalf("delete failed: %s", err)
+		}
+	}()
+	all, err := listAll(ctx, s, "", "", 10000, true)
+	var dels []string
+	for _, object := range all {
+		dels = append(dels, object.Key())
+	}
+	for i := len(dels) - 1; i >= 0; i-- {
+		_ = s.Delete(ctx, dels[i])
+	}
+
+	var scPut string
+	key := "测试编码文件" + `{"name":"juicefs"}` + string('\u001F') + "%uFF081%uFF09.jpg"
+	if err := s.Put(context.WithValue(ctx, TierKey{}, uint8(1)), key, bytes.NewReader(nil), WithStorageClass(&scPut)); err != nil {
+		t.Logf("PUT testEncodeFile failed: %s", err.Error())
+	} else {
+		if scPut != sc {
+			t.Fatalf("Storage class should be %q, got %q", sc, scPut)
+		}
+		if resp, _, _, err := s.List(ctx, "测试编码文件", "", "", "", 1, true); err != nil && err != notSupported {
+			t.Logf("List testEncodeFile Failed: %s", err)
+		} else if len(resp) == 1 && resp[0].Key() != key {
+			t.Logf("List testEncodeFile Failed: expect key %s, but got %s", key, resp[0].Key())
+		}
+	}
+	_ = s.Delete(ctx, key)
+
+	_, err = s.Get(ctx, "not_exists", 0, -1)
+	if err == nil {
+		t.Fatalf("Get should failed: %s", err)
+	}
+	if _, err := s.Head(ctx, string(make([]byte, 8<<10))); err == nil {
+		t.Logf("Head should failed: %s", err)
+	}
+
+	br := []byte("hello")
+	if err := s.Put(ctx, "test", bytes.NewReader(br)); err != nil {
+		t.Fatalf("PUT failed: %s", err.Error())
+	}
+
+	var scGet string
+	// get all
+	if d, e := get(s, "test", 0, -1, WithStorageClass(&scGet)); e != nil || d != "hello" {
+		t.Fatalf("expect hello, but got %v, error: %s", d, e)
+	}
+	if scGet != sc { // Relax me when testing against a storage that doesn't use specified storage class
+		t.Fatalf("Storage class should be %q, got %q", sc, scGet)
+	}
+
+	if d, e := get(s, "test", 0, 5); e != nil || d != "hello" {
+		t.Fatalf("expect hello, but got %v, error: %s", d, e)
+	}
+	// get first
+	if d, e := get(s, "test", 0, 1); e != nil || d != "h" {
+		t.Fatalf("expect h, but got %v, error: %s", d, e)
+	}
+	// get last
+	if d, e := get(s, "test", 4, 1); e != nil || d != "o" {
+		t.Fatalf("expect o, but got %v, error: %s", d, e)
+	}
+	// get last 3
+	if d, e := get(s, "test", 2, 3); e != nil || d != "llo" {
+		t.Fatalf("expect llo, but got %v, error: %s", d, e)
+	}
+	// get middle
+	if d, e := get(s, "test", 2, 2); e != nil || d != "ll" {
+		t.Fatalf("expect ll, but got %v, error: %s", d, e)
+	}
+	// get the end out of range
+	if d, e := get(s, "test", 4, 2); e != nil || d != "o" {
+		t.Logf("out-of-range get: 'o', but got %v, error: %s", len(d), e)
+	}
+	// get the off out of range
+	if d, e := get(s, "test", 6, 2); e != nil || d != "" {
+		t.Logf("out-of-range get: '', but got %v, error: %s", len(d), e)
+	}
+	switch s.(*withPrefix).os.(type) {
+	case FileSystem:
+		objs, err2 := listAll(ctx, s, "", "", 2, true)
+		if err2 == nil {
+			if len(objs) != 2 {
+				t.Fatalf("List should return 2 keys, but got %d", len(objs))
+			}
+			if objs[0].Key() != "" {
+				t.Fatalf("First key should be empty string, but got %s", objs[0].Key())
+			}
+			if objs[0].Size() != 0 {
+				t.Fatalf("First object size should be 0, but got %d", objs[0].Size())
+			}
+			if objs[1].Key() != "test" {
+				t.Fatalf("Second key should be test, but got %s", objs[1].Key())
+			}
+			if !strings.Contains(s.String(), "encrypted") && objs[1].Size() != 5 {
+				t.Fatalf("Size of first key shold be 5, but got %v", objs[1].Size())
+			}
+			now := time.Now()
+			if objs[1].Mtime().Before(now.Add(-30*time.Second)) || objs[1].Mtime().After(now.Add(time.Second*30)) {
+				t.Fatalf("Mtime of key should be within 30 seconds, but got %s", objs[1].Mtime().Sub(now))
+			}
+		} else {
+			t.Fatalf("list failed: %s", err2.Error())
+		}
+
+		objs, err2 = listAll(ctx, s, "", "test2", 1, true)
+		if err2 != nil {
+			t.Fatalf("list3 failed: %s", err2.Error())
+		} else if len(objs) != 0 {
+			t.Fatalf("list3 should not return anything, but got %d", len(objs))
+		}
+	default:
+		objs, err2 := listAll(ctx, s, "", "", 1, true)
+		if err2 == nil {
+			if len(objs) != 1 {
+				t.Fatalf("List should return 1 keys, but got %d", len(objs))
+			}
+			if objs[0].Key() != "test" {
+				t.Fatalf("First key should be test, but got %s", objs[0].Key())
+			}
+			if !strings.Contains(s.String(), "encrypted") && objs[0].Size() != 5 {
+				t.Fatalf("Size of first key shold be 5, but got %v", objs[0].Size())
+			}
+			now := time.Now()
+			if objs[0].Mtime().Before(now.Add(-30*time.Second)) || objs[0].Mtime().After(now.Add(time.Second*30)) {
+				t.Fatalf("Mtime of key should be within 30 seconds, but got %s", objs[0].Mtime().Sub(now))
+			}
+		} else {
+			t.Fatalf("list failed: %s", err2.Error())
+		}
+
+		objs, err2 = listAll(ctx, s, "", "test2", 1, true)
+		if err2 != nil {
+			t.Fatalf("list3 failed: %s", err2.Error())
+		} else if len(objs) != 0 {
+			t.Fatalf("list3 should not return anything, but got %d", len(objs))
+		}
+	}
+
+	defer s.Delete(ctx, "a/")
+	defer s.Delete(ctx, "a/a")
+	if err := s.Put(ctx, "a/a", bytes.NewReader(br)); err != nil {
+		t.Fatalf("PUT failed: %s", err.Error())
+	}
+	defer s.Delete(ctx, "a/a1")
+	if err := s.Put(ctx, "a/a1", bytes.NewReader(br)); err != nil {
+		t.Fatalf("PUT failed: %s", err.Error())
+	}
+	defer s.Delete(ctx, "b/")
+	defer s.Delete(ctx, "b/b")
+	if err := s.Put(ctx, "b/b", bytes.NewReader(br)); err != nil {
+		t.Fatalf("PUT failed: %s", err.Error())
+	}
+	defer s.Delete(ctx, "b/b1")
+	if err := s.Put(ctx, "b/b1", bytes.NewReader(br)); err != nil {
+		t.Fatalf("PUT failed: %s", err.Error())
+	}
+	defer s.Delete(ctx, "c/")
+	//tikv will appear empty value is not supported
+	if err1 := s.Put(ctx, "c/", bytes.NewReader(nil)); err1 != nil {
+		//minio will appear XMinioObjectExistsAsDirectory: Object name already exists as a directory. status code:  409
+		if err2 := s.Put(ctx, "c/", bytes.NewReader(br)); err2 != nil {
+			t.Fatalf("PUT failed err1: %s, err2: %s", err1.Error(), err2.Error())
+		}
+	}
+	defer s.Delete(ctx, "a1")
+	if err := s.Put(ctx, "a1", bytes.NewReader(br)); err != nil {
+		t.Fatalf("PUT failed: %s", err.Error())
+	}
+	defer func() {
+		// file systems create the parent directories implicitly
+		for _, k := range []string{"a/b/c/d/e/f", "a/b/c/d/e/", "a/b/c/d/", "a/b/c/", "a/b/"} {
+			_ = s.Delete(ctx, k)
+		}
+	}()
+	if err := s.Put(ctx, "a/b/c/d/e/f", bytes.NewReader(br)); err != nil {
+		t.Fatalf("PUT failed: %s", err.Error())
+	}
+
+	br = []byte("hello2")
+	if err := s.Put(ctx, "a1", bytes.NewReader(br)); err != nil {
+		t.Fatalf("PUT failed: %s", err.Error())
+	}
+
+	if obs, more, nextMarker, err := s.List(ctx, "", "", "", "/", 4, true); err != nil {
+		if !errors.Is(err, notSupported) {
+			t.Fatalf("list: %s", err)
+		} else {
+			t.Logf("list is not supported")
+		}
+	} else {
+		if _, ok := s.(*withPrefix).os.(FileSystem); !ok {
+			keys := []string{"a/", "a1", "b/", "c/"}
+			if len(obs) != 4 {
+				t.Fatalf("list should return 4 results but got %d", len(obs))
+			}
+			for i, o := range obs {
+				if o.Key() != keys[i] {
+					t.Fatalf("should get key %s but got %s", keys[i], o.Key())
+				}
+			}
+			if !more {
+				t.Fatalf("should have more results")
+			}
+			if nextMarker == "" {
+				t.Fatalf("next marker should not be empty")
+			}
+			obs, more, nextMarker, err = s.List(ctx, "", obs[len(obs)-1].Key(), nextMarker, "/", 4, true)
+			if err != nil {
+				t.Fatalf("list with marker: %s", err)
+			}
+			if len(obs) != 1 {
+				t.Fatalf("list should return 1 results but got %d", len(obs))
+			}
+			if obs[0].Key() != "test" {
+				t.Fatalf("should get key test but got %s", obs[0].Key())
+			}
+			_, more, nextMarker, err = s.List(ctx, "", obs[len(obs)-1].Key(), nextMarker, "/", 4, true)
+			if more {
+				t.Fatalf("should no more results")
+			}
+			if nextMarker != "" {
+				t.Fatalf("next marker should not be empty")
+			}
+		}
+	}
+
+	if obs, _, _, err := s.List(ctx, "", "", "", "/", 10, true); err != nil {
+		if !errors.Is(err, notSupported) {
+			t.Fatalf("list with delimiter: %s", err)
+		} else {
+			t.Logf("list with delimiter is not supported")
+		}
+	} else {
+		switch s.(*withPrefix).os.(type) {
+		case FileSystem:
+			if len(obs) == 0 || obs[0].Key() != "" {
+				t.Fatalf("list should return itself")
+			} else {
+				obs = obs[1:] // ignore itself
+			}
+		}
+		if len(obs) != 5 {
+			t.Fatalf("list with delimiter should return five results but got %d", len(obs))
+		}
+		keys := []string{"a/", "a1", "b/", "c/", "test"}
+		for i, o := range obs {
+			if o.Key() != keys[i] {
+				t.Fatalf("should get key %s but got %s", keys[i], o.Key())
+			}
+		}
+	}
+
+	if obs, _, _, err := s.List(ctx, "a", "", "", "/", 10, true); err != nil {
+		if !errors.Is(err, notSupported) {
+			t.Fatalf("list with delimiter: %s", err)
+		}
+	} else {
+		if len(obs) != 2 {
+			t.Fatalf("list with delimiter should return two results but got %d", len(obs))
+		}
+		keys := []string{"a/", "a1"}
+		for i, o := range obs {
+			if o.Key() != keys[i] {
+				t.Fatalf("should get key %s but got %s", keys[i], o.Key())
+			}
+		}
+	}
+
+	if obs, _, _, err := s.List(ctx, "a/", "", "", "/", 10, true); err != nil {
+		if !errors.Is(err, notSupported) {
+			t.Fatalf("list with delimiter: %s", err)
+		} else {
+			t.Logf("list with delimiter is not supported")
+		}
+	} else {
+		switch s.(*withPrefix).os.(type) {
+		case FileSystem:
+			if len(obs) == 0 || obs[0].Key() != "a/" {
+				t.Fatalf("list should return itself")
+			} else {
+				obs = obs[1:] // ignore itself
+			}
+		}
+		if len(obs) != 3 {
+			t.Fatalf("list with delimiter should return three results but got %d", len(obs))
+		}
+		keys := []string{"a/a", "a/a1", "a/b/"}
+		for i, o := range obs {
+			if o.Key() != keys[i] {
+				t.Fatalf("should get key %s but got %s", keys[i], o.Key())
+			}
+		}
+	}
+
+	// test redis cluster list all api
+	keyTotal := 100
+	var sortedKeys []string
+	for i := 0; i < keyTotal; i++ {
+		k := fmt.Sprintf("hashKey%d", i)
+		sortedKeys = append(sortedKeys, k)
+		if err := s.Put(ctx, k, bytes.NewReader(br)); err != nil {
+			t.Fatalf("PUT failed: %s", err.Error())
+		}
+	}
+	sort.Strings(sortedKeys)
+	defer func() {
+		for i := 0; i < keyTotal; i++ {
+			_ = s.Delete(ctx, fmt.Sprintf("hashKey%d", i))
+		}
+	}()
+	objs, err := listAll(ctx, s, "hashKey", "", int64(keyTotal), true)
+	if err != nil {
+		t.Fatalf("list4 failed: %s", err.Error())
+	} else {
+		for i := 0; i < keyTotal; i++ {
+			if objs[i].Key() != sortedKeys[i] {
+				t.Fatal("The result for list4 is incorrect")
+			}
+			if sc != "" && objs[i].StorageClass() != sc {
+				t.Fatal("storage class is not correct")
+			}
+		}
+	}
+
+	f, _ := os.CreateTemp("", "test")
+	f.Write([]byte("this is a file"))
+	f.Seek(0, 0)
+	os.Remove(f.Name())
+	defer f.Close()
+	if err := s.Put(ctx, "file", f); err != nil {
+		t.Fatalf("failed to put from file")
+	} else if _, err := s.Head(ctx, "file"); err != nil {
+		t.Fatalf("file should exists")
+	} else {
+		if err := s.Delete(ctx, "file"); err != nil {
+			t.Fatalf("delete failed %s", err)
+		}
+	}
+
+	if _, err := s.Head(ctx, "not-exist-file"); !os.IsNotExist(err) {
+		t.Fatal("err should be os.ErrNotExist")
+	}
+
+	if o, err := s.Head(ctx, "test"); err != nil {
+		t.Fatalf("check exists failed: %s", err.Error())
+	} else if sc != "" && o.StorageClass() != sc {
+		t.Fatalf("storage class should be %s but got %s", sc, o.StorageClass())
+	}
+
+	dstKey := "test-copy"
+	defer s.Delete(ctx, dstKey)
+	err = s.Copy(ctx, fmt.Sprintf("%s%s", prefix, dstKey), fmt.Sprintf("%stest", prefix))
+	if err != nil && err != notSupported {
+		t.Fatalf("copy failed: %s", err.Error())
+	}
+	if err == nil {
+		if o, err := s.Head(ctx, dstKey); err != nil {
+			t.Fatalf("check exists failed: %s", err.Error())
+		} else if sc != "" && o.StorageClass() != sc {
+			t.Fatalf("storage class should be %s but got %s", sc, o.StorageClass())
+		}
+	}
+
+	if err := s.Delete(ctx, "test"); err != nil {
+		t.Fatalf("delete failed: %s", err)
+	}
+
+	if err := s.Delete(ctx, "test"); err != nil {
+		t.Fatalf("delete non exists: %v", err)
+	}
+
+	getMockData := func(seed []byte, idx int) []byte {
+		size := len(seed)
+		if size == 0 {
+			return nil
+		}
+		content := make([]byte, size)
+		if idx == 0 {
+			content = seed
+		} else {
+			i := idx % size
+			copy(content[:size-i], seed[i:size])
+			copy(content[size-i:size], seed[:i])
+		}
+		return content
+	}
+	k := "large"
+	defer s.Delete(ctx, k)
+
+	if upload, err := s.CreateMultipartUpload(ctx, k); err == nil {
+		total := 3
+		seed := make([]byte, upload.MinPartSize)
+		utils.RandRead(seed)
+		parts := make([]*Part, total)
+		content := make([][]byte, total)
+		for i := 0; i < total; i++ {
+			content[i] = getMockData(seed, i)
+		}
+		pool := make(chan struct{}, 4)
+		errCh := make(chan error, total)
+		var wg sync.WaitGroup
+		for i := 1; i <= total; i++ {
+			pool <- struct{}{}
+			wg.Add(1)
+			num := i
+			go func() {
+				defer func() {
+					<-pool
+					wg.Done()
+				}()
+				var err error
+				parts[num-1], err = s.UploadPart(ctx, k, upload.UploadID, num, content[num-1])
+				if err != nil {
+					errCh <- fmt.Errorf("multipart upload error: %v", err)
+				}
+			}()
+		}
+		wg.Wait()
+		close(errCh)
+
+		for err := range errCh {
+			t.Fatalf("Test failed: %v", err)
+		}
+
+		// overwrite the first part
+		firstPartContent := append(getMockData(seed, 0), getMockData(seed, 0)...)
+		if len(firstPartContent) < int(s.Limits().MaxPartSize) {
+			firstPartContent = getMockData(seed, 0)
+			firstPartContent[0] = 'a'
+		}
+		oldPart := parts[0]
+		if parts[0], err = s.UploadPart(ctx, k, upload.UploadID, 1, firstPartContent); err != nil {
+			t.Logf("overwrite the first part error: %v", err)
+			parts[0] = oldPart
+		} else {
+			content[0] = firstPartContent
+		}
+
+		// overwrite the last part
+		lastPartContent := []byte("hello")
+		oldPart = parts[total-1]
+		if parts[total-1], err = s.UploadPart(ctx, k, upload.UploadID, total, lastPartContent); err != nil {
+			t.Logf("overwrite the last part error: %v", err)
+			parts[total-1] = oldPart
+		} else {
+			content[total-1] = lastPartContent
+		}
+
+		if err = s.CompleteUpload(ctx, k, upload.UploadID, parts); err != nil {
+			t.Fatalf("failed to complete multipart upload: %v", err)
+		}
+		if meta, err := s.Head(ctx, k); err != nil {
+			t.Fatalf("failed to head object: %v", err)
+		} else if sc != "" && meta.StorageClass() != sc {
+			t.Fatalf("storage class should be %s but got %s", sc, meta.StorageClass())
+		}
+		checkContent := func(key string, content []byte) {
+			r, err := s.Get(ctx, key, 0, -1)
+			if err != nil {
+				t.Fatalf("failed to get multipart upload file: %v", err)
+			}
+			defer r.Close()
+			cnt, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatalf("failed to get multipart upload file: %v", err)
+			}
+			if !bytes.Equal(cnt, content) {
+				t.Fatal("the content of the multipart upload file is incorrect")
+			}
+		}
+		checkContent(k, bytes.Join(content, nil))
+
+		if s.Limits().IsSupportUploadPartCopy {
+			var copyUpload *MultipartUpload
+			var dstKey = "dstUploadPartCopyKey"
+			defer s.Delete(ctx, dstKey)
+			if copyUpload, err = s.CreateMultipartUpload(ctx, dstKey); err != nil {
+				t.Fatalf("failed to create multipart upload: %v", err)
+			}
+			copyParts := make([]*Part, total)
+			var startIdx = 0
+			for i, c := range content {
+				copyParts[i], err = s.UploadPartCopy(ctx, dstKey, copyUpload.UploadID, i+1, k, int64(startIdx), int64(len(c)))
+				if err != nil {
+					t.Fatalf("failed to upload part copy: %v", err)
+				}
+				startIdx += len(c)
+			}
+			if err = s.CompleteUpload(ctx, dstKey, copyUpload.UploadID, copyParts); err != nil {
+				t.Fatalf("failed to complete multipart upload: %v", err)
+			}
+			checkContent(dstKey, bytes.Join(content, nil))
+		}
+	} else {
+		t.Logf("%s does not support multipart upload: %s", s, err.Error())
+	}
+
+	// Copy empty objects
+	defer func() {
+		if err := s.Delete(ctx, "empty"); err != nil {
+			t.Logf("delete empty file failed: %s", err)
+		}
+	}()
+
+	if err := s.Put(ctx, "empty", bytes.NewReader([]byte{})); err != nil {
+		t.Logf("PUT empty object failed: %s", err.Error())
+	}
+
+	// Copy `/` suffixed object
+	defer func() {
+		if err := s.Delete(ctx, "slash/"); err != nil {
+			t.Logf("delete slash/ failed %s", err)
+		}
+	}()
+	if err := s.Put(ctx, "slash/", bytes.NewReader([]byte{})); err != nil {
+		t.Logf("PUT `/` suffixed object failed: %s", err.Error())
+	}
+}
+
+func TestMem(t *testing.T) {
+	m, _ := newMem("", "", "", "")
+	testStorage(t, m)
+}
+
+func TestDisk(t *testing.T) {
+	diskPath := t.TempDir() + "/"
+	s, _ := newDisk(diskPath, "", "", "")
+	testStorage(t, s)
+}
+
+func TestQingStor(t *testing.T) { //skip mutate
+	if os.Getenv("QY_ACCESS_KEY") == "" {
+		t.SkipNow()
+	}
+	s, _ := newQingStor(os.Getenv("QY_ENDPOINT"),
+		os.Getenv("QY_ACCESS_KEY"), os.Getenv("QY_SECRET_KEY"), "")
+	testStorage(t, s)
+
+	//private cloud
+	if os.Getenv("PRIVATE_QY_ACCESS_KEY") == "" {
+		t.SkipNow()
+	}
+	s2, _ := newQingStor("http://test.jn1.is.shanhe.com",
+		os.Getenv("PRIVATE_QY_ACCESS_KEY"), os.Getenv("PRIVATE_QY_SECRET_KEY"), "")
+	testStorage(t, s2)
+}
+
+func TestS3(t *testing.T) { //skip mutate
+	if os.Getenv("AWS_ACCESS_KEY_ID") == "" {
+		t.SkipNow()
+	}
+	s, _ := newS3(os.Getenv("AWS_ENDPOINT"),
+		os.Getenv("AWS_ACCESS_KEY_ID"),
+		os.Getenv("AWS_SECRET_ACCESS_KEY"),
+		os.Getenv("AWS_SESSION_TOKEN"))
+	testStorage(t, s)
+}
+
+func TestOracleCompileRegexp(t *testing.T) {
+	ep := "axntujn0ebj1.compat.objectstorage.ap-singapore-1.oraclecloud.com"
+	oracleCompile := regexp.MustCompile(oracleCompileRegexp)
+	if oracleCompile.MatchString(ep) {
+		if submatch := oracleCompile.FindStringSubmatch(ep); len(submatch) >= 2 {
+			if submatch[1] != "ap-singapore-1" {
+				t.Fatalf("oracle endpoint parse failed")
+			}
+		} else {
+			t.Fatalf("oracle endpoint parse failed")
+		}
+	} else {
+		t.Fatalf("oracle endpoint parse failed")
+	}
+}
+
+func TestOVHCompileRegexp(t *testing.T) {
+	for _, ep := range []string{"s3.gra.cloud.ovh.net", "s3.gra.perf.cloud.ovh.net", "s3.gra.io.cloud.ovh.net"} {
+		ovhCompile := regexp.MustCompile(OVHCompileRegexp)
+		if ovhCompile.MatchString(ep) {
+			if submatch := ovhCompile.FindStringSubmatch(ep); len(submatch) >= 2 {
+				if submatch[1] != "gra" {
+					t.Fatalf("ovh endpoint parse failed")
+				}
+			} else {
+				t.Fatalf("ovh endpoint parse failed")
+			}
+		} else {
+			t.Fatalf("ovh endpoint parse failed")
+		}
+	}
+}
+
+func TestOSS(t *testing.T) { //skip mutate
+	if os.Getenv("ALICLOUD_ACCESS_KEY_ID") == "" {
+		t.SkipNow()
+	}
+	s, _ := newOSS(os.Getenv("ALICLOUD_ENDPOINT"),
+		os.Getenv("ALICLOUD_ACCESS_KEY_ID"),
+		os.Getenv("ALICLOUD_ACCESS_KEY_SECRET"), "")
+	testStorage(t, s)
+}
+
+func TestUFile(t *testing.T) { //skip mutate
+	if os.Getenv("UCLOUD_PUBLIC_KEY") == "" {
+		t.SkipNow()
+	}
+	ufile, _ := newUFile(os.Getenv("UCLOUD_ENDPOINT"),
+		os.Getenv("UCLOUD_PUBLIC_KEY"), os.Getenv("UCLOUD_PRIVATE_KEY"), "")
+	testStorage(t, ufile)
+}
+
+func TestGS(t *testing.T) { //skip mutate
+	if os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") == "" {
+		t.SkipNow()
+	}
+	gs, _ := newGS(os.Getenv("GOOGLE_ENDPOINT"), "", "", "")
+	testStorage(t, gs)
+}
+
+func TestQiniu(t *testing.T) { //skip mutate
+	if os.Getenv("QINIU_ACCESS_KEY") == "" {
+		t.SkipNow()
+	}
+	qiniu, _ := newQiniu(os.Getenv("QINIU_ENDPOINT"),
+		os.Getenv("QINIU_ACCESS_KEY"), os.Getenv("QINIU_SECRET_KEY"), "")
+	testStorage(t, qiniu)
+	//qiniu, _ = newQiniu("https://test.cn-north-1-s3.qiniu.com",
+	//	os.Getenv("QINIU_ACCESS_KEY"), os.Getenv("QINIU_SECRET_KEY"))
+	//testStorage(t, qiniu)
+}
+
+func TestKS3(t *testing.T) { //skip mutate
+	if os.Getenv("KS3_ACCESS_KEY") == "" {
+		t.SkipNow()
+	}
+	ks3, _ := newKS3(os.Getenv("KS3_ENDPOINT"),
+		os.Getenv("KS3_ACCESS_KEY"), os.Getenv("KS3_SECRET_KEY"), "")
+	testStorage(t, ks3)
+}
+
+func TestCOS(t *testing.T) { //skip mutate
+	if os.Getenv("COS_SECRETID") == "" {
+		t.SkipNow()
+	}
+	cos, _ := newCOS(
+		os.Getenv("COS_ENDPOINT"),
+		os.Getenv("COS_SECRETID"), os.Getenv("COS_SECRETKEY"), "")
+	testStorage(t, cos)
+}
+
+func TestAzure(t *testing.T) { //skip mutate
+	if os.Getenv("AZURE_STORAGE_ACCOUNT") == "" {
+		t.SkipNow()
+	}
+	//https://containersName.core.windows.net
+	abs, _ := newWasb(os.Getenv("AZURE_ENDPOINT"),
+		os.Getenv("AZURE_STORAGE_ACCOUNT"), os.Getenv("AZURE_STORAGE_KEY"), os.Getenv("AZURE_SAS_TOKEN"))
+	testStorage(t, abs)
+}
+
+func TestB2(t *testing.T) { //skip mutate
+	if os.Getenv("B2_ACCOUNT_ID") == "" {
+		t.SkipNow()
+	}
+	b, err := newB2(os.Getenv("B2_ENDPOINT"), os.Getenv("B2_ACCOUNT_ID"), os.Getenv("B2_APP_KEY"), "")
+	if err != nil {
+		t.Fatalf("create B2: %s", err)
+	}
+	testStorage(t, b)
+}
+
+func TestSpace(t *testing.T) { //skip mutate
+	if os.Getenv("SPACE_ACCESS_KEY") == "" {
+		t.SkipNow()
+	}
+	b, _ := newSpace(os.Getenv("SPACE_ENDPOINT"), os.Getenv("SPACE_ACCESS_KEY"), os.Getenv("SPACE_SECRET_KEY"), "")
+	testStorage(t, b)
+}
+
+func TestBOS(t *testing.T) { //skip mutate
+	if os.Getenv("BDCLOUD_ACCESS_KEY") == "" {
+		t.SkipNow()
+	}
+	b, _ := newBOS(os.Getenv("BDCLOUD_ENDPOINT"),
+		os.Getenv("BDCLOUD_ACCESS_KEY"), os.Getenv("BDCLOUD_SECRET_KEY"), "")
+	testStorage(t, b)
+}
+
+func TestOBS(t *testing.T) { //skip mutate
+	if os.Getenv("HWCLOUD_ACCESS_KEY") == "" {
+		t.SkipNow()
+	}
+	b, _ := newOBS(os.Getenv("HWCLOUD_ENDPOINT"),
+		os.Getenv("HWCLOUD_ACCESS_KEY"), os.Getenv("HWCLOUD_SECRET_KEY"), "")
+	testStorage(t, b)
+}
+
+func TestNFS(t *testing.T) { //skip mutate
+	if os.Getenv("NFS_ADDR") == "" {
+		t.SkipNow()
+	}
+	b, err := newNFSStore(os.Getenv("NFS_ADDR"), os.Getenv("NFS_ACCESS_KEY"), os.Getenv("NFS_SECRET_KEY"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testStorage(t, b)
+}
+
+func TestHDFS(t *testing.T) { //skip mutate
+	conf := make(hadoopconf.HadoopConf)
+	conf["dfs.namenode.rpc-address.ns.namenode1"] = "hadoop01:8020"
+	conf["dfs.namenode.rpc-address.ns.namenode2"] = "hadoop02:8020"
+
+	checkAddr := func(addr string, expected []string, base string) {
+		addresses, basePath := parseHDFSAddr(addr, conf)
+		if !reflect.DeepEqual(addresses, expected) {
+			t.Fatalf("expected addrs is %+v but got %+v from %s", expected, addresses, addr)
+		}
+		if basePath != base {
+			t.Fatalf("expected path is %s but got %s from %s", base, basePath, addr)
+		}
+	}
+
+	checkAddr("hadoop01:8020", []string{"hadoop01:8020"}, "/")
+	checkAddr("hdfs://hadoop01:8020/", []string{"hadoop01:8020"}, "/")
+	checkAddr("hadoop01:8020/user/juicefs/", []string{"hadoop01:8020"}, "/user/juicefs/")
+	checkAddr("hadoop01:8020/user/juicefs", []string{"hadoop01:8020"}, "/user/juicefs/")
+	checkAddr("hdfs://hadoop01:8020/user/juicefs/", []string{"hadoop01:8020"}, "/user/juicefs/")
+
+	// for HA
+	checkAddr("hadoop01:8020,hadoop02:8020", []string{"hadoop01:8020", "hadoop02:8020"}, "/")
+	checkAddr("hadoop01:8020,hadoop02:8020/user/juicefs/", []string{"hadoop01:8020", "hadoop02:8020"}, "/user/juicefs/")
+	checkAddr("hdfs://ns/user/juicefs", []string{"hadoop01:8020", "hadoop02:8020"}, "/user/juicefs/")
+	checkAddr("ns/user/juicefs/", []string{"hadoop01:8020", "hadoop02:8020"}, "/user/juicefs/")
+
+	if os.Getenv("HDFS_ADDR") == "" {
+		t.SkipNow()
+	}
+	dfs, _ := newHDFS(os.Getenv("HDFS_ADDR"), "", "", "")
+	testStorage(t, dfs)
+}
+
+func TestOOS(t *testing.T) { //skip mutate
+	if os.Getenv("OOS_ACCESS_KEY") == "" {
+		t.SkipNow()
+	}
+	b, _ := newOOS(os.Getenv("OOS_ENDPOINT"),
+		os.Getenv("OOS_ACCESS_KEY"), os.Getenv("OOS_SECRET_KEY"), "")
+	testStorage(t, b)
+}
+
+func TestScw(t *testing.T) { //skip mutate
+	if os.Getenv("SCW_ACCESS_KEY") == "" {
+		t.SkipNow()
+	}
+	b, _ := newScw(os.Getenv("SCW_ENDPOINT"), os.Getenv("SCW_ACCESS_KEY"), os.Getenv("SCW_SECRET_KEY"), "")
+	testStorage(t, b)
+}
+
+func TestMinIO(t *testing.T) {
+	if os.Getenv("MINIO_TEST_BUCKET") == "" {
+		t.SkipNow()
+	}
+	b, _ := newMinio(os.Getenv("MINIO_TEST_BUCKET"), os.Getenv("MINIO_ACCESS_KEY"), os.Getenv("MINIO_SECRET_KEY"), "")
+	testStorage(t, b)
+}
+
+// func TestUpYun(t *testing.T) {
+// 	s, _ := newUpyun("http://jfstest", "test", "")
+// 	testStorage(t, s)
+// }
+
+func TestTiKV(t *testing.T) { //skip mutate
+	if os.Getenv("TIKV_ADDR") == "" {
+		t.SkipNow()
+	}
+	s, err := newTiKV(os.Getenv("TIKV_ADDR"), "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testStorage(t, s)
+}
+
+func TestRedis(t *testing.T) {
+	if os.Getenv("REDIS_ADDR") == "" {
+		t.SkipNow()
+	}
+
+	opt, _ := redis.ParseURL(os.Getenv("REDIS_ADDR"))
+	rdb := redis.NewClient(opt)
+	_ = rdb.FlushDB(context.Background())
+
+	s, err := newRedis(os.Getenv("REDIS_ADDR"), "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testStorage(t, s)
+}
+
+func TestSwift(t *testing.T) { //skip mutate
+	if os.Getenv("SWIFT_ADDR") == "" {
+		t.SkipNow()
+	}
+	s, err := newSwiftOSS(os.Getenv("SWIFT_ADDR"), "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testStorage(t, s)
+}
+
+func TestWebDAV(t *testing.T) { //skip mutate
+	if os.Getenv("WEBDAV_TEST_BUCKET") == "" {
+		t.SkipNow()
+	}
+	s, _ := newWebDAV(os.Getenv("WEBDAV_TEST_BUCKET"), "", "", "")
+	testStorage(t, s)
+}
+
+func TestEncrypted(t *testing.T) {
+	s, _ := CreateStorage("mem", "", "", "", "")
+	privkey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	kc := NewRSAEncryptor(privkey)
+	dc, _ := NewDataEncryptor(kc, AES256GCM_RSA)
+	es := NewEncrypted(s, dc)
+	testStorage(t, es)
+}
+
+func TestMarsharl(t *testing.T) {
+	ctx := context.Background()
+	if os.Getenv("HDFS_ADDR") == "" {
+		t.SkipNow()
+	}
+	s, _ := newHDFS(os.Getenv("HDFS_ADDR"), "", "", "")
+	if err := s.Put(ctx, "hello", bytes.NewReader([]byte("world"))); err != nil {
+		t.Fatalf("PUT failed: %s", err)
+	}
+	fs := s.(FileSystem)
+	_ = fs.Chown("hello", "user", "group")
+	_ = fs.Chmod("hello", 0764)
+	o, err := s.Head(ctx, "hello")
+	if err != nil {
+		t.Fatalf("HEAD failed: %s", err)
+	}
+
+	m := MarshalObject(o)
+	d, _ := json.Marshal(m)
+	var m2 map[string]interface{}
+	if err := json.Unmarshal(d, &m2); err != nil {
+		t.Fatalf("unmarshal: %s", err)
+	}
+	o2 := UnmarshalObject(m2)
+	if math.Abs(float64(o2.Mtime().UnixNano()-o.Mtime().UnixNano())) > 1000 {
+		t.Fatalf("mtime %s != %s", o2.Mtime(), o.Mtime())
+	}
+	o2.(*file).mtime = o.Mtime()
+	if !reflect.DeepEqual(o, o2) {
+		t.Fatalf("%+v != %+v", o2, o)
+	}
+}
+
+func TestSharding(t *testing.T) {
+	s, _ := NewSharded("mem", "%d", "", "", "", 10)
+	testStorage(t, s)
+
+	// percent-encoded query values must not be taken as formatting verbs
+	query := "auth-url=https%3A%2F%2Fa.com%2Fv3"
+	s, err := NewSharded("mem", "jfs%d?"+query, "", "", "", 2)
+	if err != nil {
+		t.Fatalf("create sharded storage: %s", err)
+	}
+	for i, store := range s.(*sharded).stores {
+		if want := fmt.Sprintf("mem://jfs%d?%s/", i, query); store.String() != want {
+			t.Fatalf("shard %d: got %s, want %s", i, store, want)
+		}
+	}
+	if _, err := NewSharded("mem", "jfs?"+query, "", "", "", 2); err == nil {
+		t.Fatal("expected an error for an endpoint without a shard placeholder outside the query")
+	}
+}
+
+// tokenPagedStore pages by continuation token only and treats startAfter as a
+// client-side filter, like qiniu; the first failures continuation calls fail.
+type tokenPagedStore struct {
+	ObjectStorage
+	keys     []string
+	failures int
+}
+
+func (s *tokenPagedStore) List(ctx context.Context, prefix, startAfter, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
+	var start int
+	if token != "" {
+		if s.failures > 0 {
+			s.failures--
+			return nil, false, "", errors.New("transient list error")
+		}
+		_, _ = fmt.Sscanf(token, "%d", &start)
+	}
+	end := start + 2
+	if end > len(s.keys) {
+		end = len(s.keys)
+	}
+	var objs []Object
+	for _, k := range s.keys[start:end] {
+		if k > startAfter {
+			objs = append(objs, &obj{key: k})
+		}
+	}
+	if len(objs) == 0 {
+		return nil, false, "", nil
+	}
+	if end == len(s.keys) {
+		return objs, false, "", nil
+	}
+	return objs, true, fmt.Sprintf("%d", end), nil
+}
+
+func TestShardingListRetryKeepsToken(t *testing.T) {
+	keys := []string{"k0", "k1", "k2", "k3", "k4", "k5"}
+	mem, _ := newMem("paged", "", "", "")
+	s := &sharded{stores: []ObjectStorage{&tokenPagedStore{ObjectStorage: mem, keys: keys, failures: 1}}}
+	ch, err := s.ListAll(context.Background(), "", "", false)
+	if err != nil {
+		t.Fatalf("list all: %s", err)
+	}
+	var got []string
+	for o := range ch {
+		if o == nil {
+			t.Fatal("list all returned nil object")
+		}
+		got = append(got, o.Key())
+	}
+	if !reflect.DeepEqual(got, keys) {
+		t.Fatalf("unexpected keys: got %v, want %v", got, keys)
+	}
+}
+
+func TestListAllRetryLimit(t *testing.T) {
+	keys := []string{"k0", "k1", "k2", "k3"}
+	mem, _ := newMem("paged", "", "", "")
+	for _, c := range []struct {
+		failures int
+		want     []string
+		failed   bool
+	}{
+		{maxListRetries, keys, false},
+		{maxListRetries + 1, keys[:2], true},
+	} {
+		t.Run(fmt.Sprintf("failures=%d", c.failures), func(t *testing.T) {
+			ch, err := ListAll(context.Background(), &tokenPagedStore{ObjectStorage: mem, keys: keys, failures: c.failures}, "", "", false, true)
+			if err != nil {
+				t.Fatalf("list all: %s", err)
+			}
+			var got []string
+			var failed bool
+			timeout := time.After(10 * time.Second)
+			for done := false; !done; {
+				select {
+				case o, ok := <-ch:
+					if !ok {
+						done = true
+					} else if o == nil {
+						failed = true
+					} else {
+						got = append(got, o.Key())
+					}
+				case <-timeout:
+					t.Fatalf("list all does not stop after %d failures, got %v", c.failures, got)
+				}
+			}
+			if failed != c.failed || !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("got %v (failed %v), want %v (failed %v)", got, failed, c.want, c.failed)
+			}
+		})
+	}
+}
+
+// listStub sends keys (then a nil if fail is set) on an unbuffered channel and
+// closes done when its producer exits.
+type listStub struct {
+	ObjectStorage
+	keys []string
+	fail bool
+	done chan struct{}
+}
+
+func (s *listStub) String() string { return "stub://" }
+
+func (s *listStub) ListAll(ctx context.Context, prefix, marker string, followLink bool) (<-chan Object, error) {
+	ch := make(chan Object)
+	go func() {
+		defer close(s.done)
+		defer close(ch)
+		for _, k := range s.keys {
+			ch <- &obj{key: k}
+		}
+		if s.fail {
+			ch <- nil
+		}
+	}()
+	return ch, nil
+}
+
+func TestShardingListFailedShard(t *testing.T) {
+	var goodKeys []string
+	for i := 0; i < 100; i++ {
+		goodKeys = append(goodKeys, fmt.Sprintf("k%03d", i))
+	}
+	cases := []struct {
+		name    string
+		badKeys []string
+		wantErr bool
+		want    []string
+	}{
+		{name: "first", wantErr: true},
+		{name: "merging", badKeys: []string{"a"}, want: []string{"a"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			bad := &listStub{keys: c.badKeys, fail: true, done: make(chan struct{})}
+			good := &listStub{keys: goodKeys, done: make(chan struct{})}
+			s := &sharded{stores: []ObjectStorage{good, bad}}
+			ch, err := s.ListAll(context.Background(), "", "", false)
+			if c.wantErr {
+				if err == nil {
+					t.Fatal("expect error for a failed shard")
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("list all: %s", err)
+				}
+				var got []string
+				var sawNil bool
+				for o := range ch {
+					if o == nil {
+						sawNil = true
+						break
+					}
+					got = append(got, o.Key())
+				}
+				if !sawNil {
+					t.Fatalf("failed shard not reported, got %v", got)
+				}
+				if !reflect.DeepEqual(got, c.want) {
+					t.Fatalf("got %v, want %v", got, c.want)
+				}
+			}
+			select {
+			case <-good.done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("listing of the healthy shard is leaked")
+			}
+		})
+	}
+}
+
+func TestSQLite(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "teststore.db")
+	s, err := newSQLStore("sqlite3", dbPath, "", "")
+	if err != nil {
+		t.Fatalf("create: %s", err)
+	}
+	testStorage(t, s)
+}
+
+func TestListPrefixBoundary(t *testing.T) {
+	for _, backend := range []string{"mem", "file", "sqlite3"} {
+		t.Run(backend, func(t *testing.T) {
+			var store ObjectStorage
+			var err error
+			switch backend {
+			case "mem":
+				store, err = newMem("prefix-test", "", "", "")
+			case "file":
+				store, err = newDisk(t.TempDir()+"/", "", "", "")
+			case "sqlite3":
+				store, err = newSQLStore("sqlite3", filepath.Join(t.TempDir(), "prefix.db"), "", "")
+				if err == nil {
+					t.Cleanup(func() { _ = store.(*sqlStore).db.Close() })
+				}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			testListPrefixBoundary(t, store)
+		})
+	}
+}
+
+func testListPrefixBoundary(t *testing.T, store ObjectStorage) {
+	t.Helper()
+	_, isFileSystem := store.(FileSystem)
+	_, isMinIO := store.(*minio)
+	store = WithPrefix(store, fmt.Sprintf("unit-test/list-prefix-boundary-%d/", time.Now().UnixNano()))
+	// Flat keys also allow filesystem backends to use the same fixture.
+	allKeys := []string{"a", "b", "p", "p1", "p2", "z", "测试", "测试1"}
+	t.Cleanup(func() {
+		for _, key := range allKeys {
+			if err := store.Delete(ctx, key); err != nil {
+				t.Errorf("delete %q: %s", key, err)
+			}
+		}
+		_ = store.Delete(ctx, "")
+	})
+	for _, key := range allKeys {
+		if err := store.Put(ctx, key, bytes.NewReader([]byte(key))); err != nil {
+			t.Fatalf("put %q: %s", key, err)
+		}
+	}
+	emptyPrefixKeys := allKeys
+	if isFileSystem {
+		emptyPrefixKeys = append([]string{""}, allKeys...)
+	}
+	cases := []struct {
+		name, prefix, marker string
+		want                 []string
+	}{
+		{"no-marker", "p", "", []string{"p", "p1", "p2"}},
+		{"earlier-marker", "p", "a", []string{"p", "p1", "p2"}},
+		{"exact-marker", "p", "p", []string{"p1", "p2"}},
+		{"between-marker", "p", "p0", []string{"p1", "p2"}},
+		{"later-marker", "p", "p1", []string{"p2"}},
+		{"after-prefix", "p", "z", nil},
+		{"no-matches", "q", "", nil},
+		{"empty-prefix", "", "", emptyPrefixKeys},
+		{"unicode-prefix", "测试", "p", []string{"测试", "测试1"}},
+		{"unicode-marker", "测试", "测试", []string{"测试1"}},
+	}
+	keysOf := func(t *testing.T, objects []Object) []string {
+		t.Helper()
+		var keys []string
+		for _, o := range objects {
+			if o == nil {
+				t.Fatal("listing returned a nil object")
+			}
+			keys = append(keys, o.Key())
+		}
+		return keys
+	}
+	for _, delimiter := range []string{"", "/"} {
+		name := "flat"
+		if delimiter != "" {
+			name = "delimiter"
+		}
+		t.Run("list/"+name, func(t *testing.T) {
+			if _, _, _, err := store.List(ctx, "p", "", "", delimiter, 10, true); errors.Is(err, notSupported) {
+				t.Skipf("List with delimiter %q is not supported", delimiter)
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					if isMinIO && tc.marker != "" && !strings.HasPrefix(tc.marker, tc.prefix) {
+						t.Skip("MinIO RELEASE.2022-01-25T19-56-04Z used in CI requires marker to start with prefix")
+					}
+					objects, _, _, err := store.List(ctx, tc.prefix, tc.marker, "", delimiter, 10, true)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if keys := keysOf(t, objects); !reflect.DeepEqual(keys, tc.want) {
+						t.Fatalf("keys: got %q, want %q", keys, tc.want)
+					}
+				})
+			}
+			t.Run("filtered-small-page", func(t *testing.T) {
+				objects, _, _, err := store.List(ctx, "p", "p1", "", delimiter, 2, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if keys := keysOf(t, objects); !reflect.DeepEqual(keys, []string{"p2"}) {
+					t.Fatalf("keys: got %q, want [p2]", keys)
+				}
+			})
+			for _, limit := range []int64{1, 2, 3} {
+				t.Run(fmt.Sprintf("paged/limit=%d", limit), func(t *testing.T) {
+					if isMinIO && delimiter == "" && limit == 1 {
+						t.Skip("MinIO RELEASE.2022-01-25T19-56-04Z returns an exact prefix match without IsTruncated when limit is 1")
+					}
+					marker, token := "", ""
+					var keys []string
+					for page := 0; page < 5; page++ {
+						objects, more, next, err := store.List(ctx, "p", marker, token, delimiter, limit, true)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if int64(len(objects)) > limit {
+							t.Fatalf("page exceeds limit: got %d, limit %d", len(objects), limit)
+						}
+						for _, o := range objects {
+							if o.Key() <= marker {
+								t.Fatalf("listing did not advance: key %q, marker %q", o.Key(), marker)
+							}
+							keys = append(keys, o.Key())
+							marker = o.Key()
+						}
+						if !more {
+							if want := []string{"p", "p1", "p2"}; !reflect.DeepEqual(keys, want) {
+								t.Fatalf("paged keys: got %q, want %q", keys, want)
+							}
+							return
+						}
+						if len(objects) == 0 && next == token {
+							t.Fatal("listing returned an empty page without advancing its token")
+						}
+						token = next
+					}
+					t.Fatal("listing did not terminate")
+				})
+			}
+		})
+	}
+	for _, tc := range cases {
+		t.Run("list-all/"+tc.name, func(t *testing.T) {
+			if isMinIO && tc.marker != "" && !strings.HasPrefix(tc.marker, tc.prefix) {
+				t.Skip("MinIO RELEASE.2022-01-25T19-56-04Z used in CI requires marker to start with prefix")
+			}
+			objects, err := listAll(ctx, store, tc.prefix, tc.marker, 1e9, true)
+			if errors.Is(err, notSupported) {
+				t.Skip("ListAll is not supported")
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if keys := keysOf(t, objects); !reflect.DeepEqual(keys, tc.want) {
+				t.Fatalf("keys: got %q, want %q", keys, tc.want)
+			}
+		})
+	}
+}
+
+func TestGenNextKey(t *testing.T) {
+	for _, tc := range []struct{ prefix, want string }{
+		{"p", "q"},
+		{"p/", "p0"},
+		{"p\xff", "q"},
+		{"p\xff\xff", "q"},
+		{"\xffp", "\xffq"},
+		{"\xff", ""},
+		{"\xff\xff", ""},
+		{"", ""},
+	} {
+		t.Run(fmt.Sprintf("%x", tc.prefix), func(t *testing.T) {
+			if got := genNextKey(tc.prefix); got != tc.want {
+				t.Fatalf("prefix range end: got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSQLitePutOverwrite(t *testing.T) {
+	store, err := newSQLStore("sqlite3", filepath.Join(t.TempDir(), "overwrite.db"), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.(*sqlStore).db.Close()
+	if err := store.Put(ctx, "untouched", bytes.NewReader([]byte("keep this object"))); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		data []byte
+	}{
+		{"empty", []byte{}},
+		{"nil", nil},
+		{"shorter", []byte("x")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := store.Put(ctx, tc.name, bytes.NewReader([]byte("original content"))); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Put(ctx, tc.name, bytes.NewReader(tc.data)); err != nil {
+				t.Fatal(err)
+			}
+			r, err := store.Get(ctx, tc.name, 0, -1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(r)
+			r.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, tc.data) {
+				t.Errorf("read after overwrite: got %q, want %q", got, tc.data)
+			}
+			o, err := store.Head(ctx, tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if o.Size() != int64(len(tc.data)) {
+				t.Errorf("size after overwrite: got %d, want %d", o.Size(), len(tc.data))
+			}
+			r, err = store.Get(ctx, "untouched", 0, -1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err = io.ReadAll(r)
+			r.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != "keep this object" {
+				t.Errorf("unrelated object changed: got %q", got)
+			}
+		})
+	}
+	t.Run("empty-key", func(t *testing.T) {
+		if err := store.Put(ctx, "", bytes.NewReader([]byte("original content"))); err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				if err := store.Put(ctx, "", bytes.NewReader(tc.data)); err != nil {
+					t.Fatal(err)
+				}
+				var b blob
+				ok, err := store.(*sqlStore).db.Where("`key` = ?", []byte("")).Get(&b)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !ok {
+					t.Fatal("empty-key object missing after overwrite")
+				}
+				if !bytes.Equal(b.Data, tc.data) || b.Size != int64(len(tc.data)) {
+					t.Errorf("empty-key object after overwrite: got %q, size %d; want %q, size %d", b.Data, b.Size, tc.data, len(tc.data))
+				}
+				got, err := get(store, "untouched", 0, -1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got != "keep this object" {
+					t.Errorf("unrelated object changed: got %q", got)
+				}
+				o, err := store.Head(ctx, "untouched")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if o.Size() != int64(len("keep this object")) {
+					t.Errorf("unrelated object size changed: got %d", o.Size())
+				}
+			})
+		}
+	})
+}
+
+func TestPG(t *testing.T) { //skip mutate
+	if os.Getenv("PG_ADDR") == "" {
+		t.SkipNow()
+	}
+	s, err := newSQLStore("postgres", os.Getenv("PG_ADDR"), os.Getenv("PG_USER"), os.Getenv("PG_PASSWORD"))
+	if err != nil {
+		t.Fatalf("create: %s", err)
+	}
+	testStorage(t, s)
+
+}
+func TestPGWithSearchPath(t *testing.T) { //skip mutate
+	_, err := newSQLStore("postgres", "127.0.0.1:5432/test?sslmode=disable&search_path=juicefs,public", "", "")
+	if !strings.Contains(err.Error(), "currently, only one schema is supported in search_path") {
+		t.Fatalf("TestPGWithSearchPath error: %s", err)
+	}
+}
+
+func TestMySQL(t *testing.T) { //skip mutate
+	if os.Getenv("MYSQL_ADDR") == "" {
+		t.SkipNow()
+	}
+	s, err := newSQLStore("mysql", os.Getenv("MYSQL_ADDR"), os.Getenv("MYSQL_USER"), os.Getenv("MYSQL_PASSWORD"))
+	if err != nil {
+		t.Fatalf("create: %s", err)
+	}
+	testStorage(t, s)
+}
+
+func TestNameString(t *testing.T) {
+	s, _ := newMem("test", "", "", "")
+	s = WithPrefix(s, "a/")
+	s = WithPrefix(s, "b/")
+	if s.String() != "mem://test/a/b/" {
+		t.Fatalf("name with two prefix does not match: %s", s.String())
+	}
+}
+
+func TestListAllWithDelimiterDeepStart(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name     string
+		root     string
+		keys     []string
+		start    string
+		expected []string
+	}{
+		{
+			name:     "TrailingSlashRoot",
+			root:     t.TempDir() + "/",
+			keys:     []string{"a/b/1", "a/b/2", "a/b/3", "z"},
+			start:    "a/b/2",
+			expected: []string{"a/b/2", "a/b/3", "z"},
+		},
+		{
+			name:     "NoTrailingSlashRoot",
+			root:     t.TempDir(),
+			keys:     []string{"/a/b/1", "/a/b/2", "/a/b/3", "/z"},
+			start:    "/a/b/2",
+			expected: []string{"/a/b/2", "/a/b/3", "/z"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := CreateStorage("file", tc.root, "", "", "")
+			if err != nil {
+				t.Fatalf("create storage: %s", err)
+			}
+
+			for _, key := range tc.keys {
+				if err := s.Put(ctx, key, bytes.NewReader([]byte(key))); err != nil {
+					t.Fatalf("put %s: %s", key, err)
+				}
+			}
+
+			ch, err := ListAllWithDelimiter(ctx, s, "", tc.start, "", true)
+			if err != nil {
+				t.Fatalf("list all with delimiter: %s", err)
+			}
+
+			var got []string
+			for obj := range ch {
+				if obj == nil {
+					t.Fatal("list all with delimiter returned nil object")
+				}
+				got = append(got, obj.Key())
+			}
+
+			if !reflect.DeepEqual(got, tc.expected) {
+				t.Fatalf("unexpected keys: got %v, want %v", got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestEtcd(t *testing.T) { //skip mutate
+	if os.Getenv("ETCD_ADDR") == "" {
+		t.SkipNow()
+	}
+	s, _ := newEtcd(os.Getenv("ETCD_ADDR"), "", "", "")
+	testStorage(t, s)
+}
+
+//func TestCeph(t *testing.T) {
+//	if os.Getenv("CEPH_ENDPOINT") == "" {
+//		t.SkipNow()
+//	}
+//	s, _ := newCeph(os.Getenv("CEPH_ENDPOINT"), os.Getenv("CEPH_CLUSTER"), os.Getenv("CEPH_USER"))
+//	testStorage(t, s)
+//}
+
+func TestEOS(t *testing.T) { //skip mutate
+	if os.Getenv("EOS_ENDPOINT") == "" {
+		t.SkipNow()
+	}
+	s, _ := newEos(os.Getenv("EOS_ENDPOINT"), os.Getenv("EOS_ACCESS_KEY"), os.Getenv("EOS_SECRET_KEY"), "")
+	testStorage(t, s)
+}
+
+func TestWASABI(t *testing.T) { //skip mutate
+	if os.Getenv("WASABI_ENDPOINT") == "" {
+		t.SkipNow()
+	}
+	s, _ := newWasabi(os.Getenv("WASABI_ENDPOINT"), os.Getenv("WASABI_ACCESS_KEY"), os.Getenv("WASABI_SECRET_KEY"), "")
+	testStorage(t, s)
+}
+
+func TestIBMCOS(t *testing.T) { //skip mutate
+	if os.Getenv("IBMCOS_ENDPOINT") == "" {
+		t.SkipNow()
+	}
+	s, _ := newIBMCOS(os.Getenv("IBMCOS_ENDPOINT"), os.Getenv("IBMCOS_ACCESS_KEY"), os.Getenv("IBMCOS_SECRET_KEY"), "")
+	testStorage(t, s)
+}
+
+func TestTOS(t *testing.T) { //skip mutate
+	if os.Getenv("TOS_ENDPOINT") == "" {
+		t.SkipNow()
+	}
+	tos, err := newTOS(os.Getenv("TOS_ENDPOINT"), os.Getenv("TOS_ACCESS_KEY"), os.Getenv("TOS_SECRET_KEY"), "")
+	if err != nil {
+		t.Fatalf("create: %s", err)
+	}
+	testStorage(t, tos)
+}
+
+func TestDragonfly(t *testing.T) { //skip mutate
+	if os.Getenv("DRAGONFLY_ENDPOINT") == "" {
+		t.SkipNow()
+	}
+	dragonfly, err := newDragonfly(os.Getenv("DRAGONFLY_ENDPOINT"), "", "", "")
+	if err != nil {
+		t.Fatalf("create: %s", err)
+	}
+	testStorage(t, dragonfly)
+}
+
+func TestCifs(t *testing.T) { //skip mutate
+	if os.Getenv("CIFS_ADDR") == "" {
+		fmt.Println("skip CIFS test")
+		t.SkipNow()
+	}
+	cifs, err := newCifs(os.Getenv("CIFS_ADDR"), os.Getenv("CIFS_USER"), os.Getenv("CIFS_PASSWORD"), "")
+	if err != nil {
+		t.Fatalf("create: %s", err)
+	}
+	testStorage(t, cifs)
+}
+
+// func TestBunny(t *testing.T) { //skip mutate
+// 	if os.Getenv("BUNNY_ENDPOINT") == "" {
+// 		t.SkipNow()
+// 	}
+// 	bunny, err := newBunny(os.Getenv("BUNNY_ENDPOINT"), "", os.Getenv("BUNNY_SECRET_KEY"), "")
+// 	if err != nil {
+// 		t.Fatalf("create: %s", err)
+// 	}
+// 	testStorage(t, bunny)
+// }
+
+func TestStorj(t *testing.T) { //skip mutate
+	if os.Getenv("STORJ_ACCESS_GRANT") == "" || os.Getenv("STORJ_BUCKET") == "" {
+		t.SkipNow()
+	}
+	s, err := newStorj(os.Getenv("STORJ_BUCKET"), os.Getenv("STORJ_ACCESS_GRANT"), "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testStorage(t, s)
+}
+
+func TestMain(m *testing.M) {
+	if envFile := os.Getenv("JUICEFS_ENV_FILE_FOR_TEST"); envFile != "" {
+		// schema: S3 AWS_ENDPOINT=xxxxx
+		if _, err := os.Stat(envFile); err == nil {
+			file, _ := os.ReadFile(envFile)
+			for _, line := range strings.Split(strings.TrimSpace(string(file)), "\n") {
+				if envkv := strings.SplitN(line, "=", 2); len(envkv) == 2 {
+					if err := os.Setenv(envkv[0], envkv[1]); err != nil {
+						logger.Errorf("set env %s=%s error", envkv[0], envkv[1])
+					}
+				}
+			}
+		}
+	}
+	m.Run()
+}

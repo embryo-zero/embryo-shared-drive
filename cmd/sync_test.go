@@ -1,0 +1,279 @@
+/*
+ * JuiceFS, Copyright 2021 Juicedata, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package cmd
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/juicedata/juicefs/pkg/object"
+	juicesync "github.com/juicedata/juicefs/pkg/sync"
+	"github.com/juicedata/juicefs/pkg/utils"
+)
+
+func TestCreateSyncStorageWithoutConfiguredTiers(t *testing.T) {
+	const storageName = "unsupported-sync-tier-test"
+	initCalls := 0
+	object.Register(storageName, func(bucket, accessKey, secretKey, token string) (object.ObjectStorage, error) {
+		storage, err := object.CreateStorage("mem", bucket, accessKey, secretKey, token)
+		if err != nil {
+			return nil, err
+		}
+		return &unsupportedTierStorage{ObjectStorage: storage, initCalls: &initCalls}, nil
+	})
+
+	var logs bytes.Buffer
+	originalOutput := logger.Out
+	logger.SetOutput(&logs)
+	defer logger.SetOutput(originalOutput)
+
+	if _, err := createSyncStorage(storageName+"://bucket/prefix", &juicesync.Config{}); err != nil {
+		t.Fatalf("create sync storage: %s", err)
+	}
+	if initCalls != 1 {
+		t.Fatalf("InitTiers called %d times, expected 1", initCalls)
+	}
+	if strings.Contains(logs.String(), "Set storage tier:") {
+		t.Fatalf("unexpected storage tier warning: %s", logs.String())
+	}
+}
+
+func TestSync(t *testing.T) {
+	if os.Getenv("MINIO_TEST_BUCKET") == "" {
+		t.Skip()
+	}
+	minioDir := "synctest"
+	localDir := filepath.Join(t.TempDir(), "synctest")
+	storage, err := object.CreateStorage("minio", os.Getenv("MINIO_TEST_BUCKET"), os.Getenv("MINIO_ACCESS_KEY"), os.Getenv("MINIO_SECRET_KEY"), "")
+	if err != nil {
+		t.Fatalf("create storage failed: %v", err)
+	}
+
+	testInstances := []struct{ path, content string }{
+		{"t1.txt", "content1"},
+		{"testDir1/t2.txt", "content2"},
+		{"testDir1/testDir3/t3.txt", "content3"},
+	}
+
+	for _, instance := range testInstances {
+		err = storage.Put(context.Background(), fmt.Sprintf("/%s/%s", minioDir, instance.path), bytes.NewReader([]byte(instance.content)))
+		if err != nil {
+			t.Fatalf("storage put failed: %v", err)
+		}
+	}
+	syncArgs := []string{"", "sync", fmt.Sprintf("minio://%s/%s", os.Getenv("MINIO_TEST_BUCKET"), minioDir), fmt.Sprintf("file://%s", localDir)}
+	err = Main(syncArgs)
+	if err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+
+	for _, instance := range testInstances {
+		c, err := os.ReadFile(fmt.Sprintf("%s/%s", localDir, instance.path))
+		if err != nil || string(c) != instance.content {
+			t.Fatalf("sync failed: %v", err)
+		}
+	}
+}
+
+func Test_isS3PathType(t *testing.T) {
+
+	tests := []struct {
+		endpoint string
+		want     bool
+	}{
+		{"localhost", true},
+		{"localhost:8080", true},
+		{"127.0.0.1", true},
+		{"127.0.0.1:8080", true},
+		{"s3.ap-southeast-1.amazonaws.com", true},
+		{"s3.ap-southeast-1.amazonaws.com:8080", true},
+		{"s3-ap-southeast-1.amazonaws.com", true},
+		{"s3-ap-southeast-1.amazonaws.com:8080", true},
+		{"s3-ap-southeast-1.amazonaws..com:8080", false},
+		{"ap-southeast-1.amazonaws.com", false},
+		{"s3-ap-southeast-1amazonaws.com:8080", false},
+		{"s3-ap-southeast-1", false},
+		{"s3-ap-southeast-1:8080", false},
+		{"br-cool-darkness-a1b2c3d4.storage.c-1.us-east-2.aws.neon.tech", true},
+		{"storage.c-1.us-east-2.aws.neon.tech", false},
+		{"ep-cool-darkness-a1b2c3d4.c-1.us-east-2.aws.neon.tech", false},
+	}
+	for _, tt := range tests {
+		t.Run("Test host", func(t *testing.T) {
+			if got := isS3PathType(tt.endpoint); got != tt.want {
+				t.Errorf("isS3PathType() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_extractToken(t *testing.T) {
+	// [NAME://][ACCESS_KEY:SECRET_KEY[:TOKEN]@]BUCKET[.ENDPOINT][/PREFIX]
+	tests := []struct {
+		uri, removedTokenUri, token string
+	}{
+		{"NAME://ACCESS_KEY:SECRET_KEY@BUCKET.ENDPOINT/PREFIX", "NAME://ACCESS_KEY:SECRET_KEY@BUCKET.ENDPOINT/PREFIX", ""},
+		{"NAME://:@BUCKET.ENDPOINT/PREFIX", "NAME://:@BUCKET.ENDPOINT/PREFIX", ""},
+		{"NAME://ACCESS_KEY:SECRET_KEY:TOKEN@BUCKET.ENDPOINT/PREFIX", "NAME://ACCESS_KEY:SECRET_KEY@BUCKET.ENDPOINT/PREFIX", "TOKEN"},
+		{"NAME://:@BUCKET.ENDPOINT/PREFIX", "NAME://:@BUCKET.ENDPOINT/PREFIX", ""},
+		{"NAME://::TOKEN@BUCKET.ENDPOINT/PREFIX", "NAME://:@BUCKET.ENDPOINT/PREFIX", "TOKEN"},
+		{"NAME://BUCKET.ENDPOINT/PREFIX", "NAME://BUCKET.ENDPOINT/PREFIX", ""},
+		{"file:///tmp/testbucket", "file:///tmp/testbucket", ""},
+		{"/tmp/testbucket", "/tmp/testbucket", ""},
+	}
+	for _, tt := range tests {
+		t.Run("", func(t *testing.T) {
+			removedTokenUri, token := extractToken(tt.uri)
+			if removedTokenUri != tt.removedTokenUri {
+				t.Errorf("extractToken() removedTokenUri = %v, want %v", removedTokenUri, tt.removedTokenUri)
+			}
+			if token != tt.token {
+				t.Errorf("extractToken() token = %v, want %v", token, tt.token)
+			}
+		})
+	}
+}
+
+func TestLoadClusterWorkerConfig(t *testing.T) {
+	t.Setenv("SECRET_KEY", "old-secret")
+	payload := bytes.NewBufferString(`{
+		"source": "oss://test-access-key:test-secret-key@test-bucket.oss.example.com/",
+		"destination": "/tmp/dst/",
+		"env": {"SECRET_KEY": "new-secret"}
+	}`)
+
+	src, dst, err := loadClusterWorkerConfig(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if src != "oss://test-access-key:test-secret-key@test-bucket.oss.example.com/" || dst != "/tmp/dst/" {
+		t.Fatalf("unexpected worker storage config: %q -> %q", src, dst)
+	}
+	if got := os.Getenv("SECRET_KEY"); got != "new-secret" {
+		t.Fatalf("worker environment was not restored: %q", got)
+	}
+}
+
+func TestSyncWorkerReadsConfigFromStdinByDefault(t *testing.T) {
+	stdin := filepath.Join(t.TempDir(), "stdin")
+	if err := os.WriteFile(stdin, []byte("invalid worker config"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(stdin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	oldStdin := os.Stdin
+	os.Stdin = f
+	t.Cleanup(func() { os.Stdin = oldStdin })
+
+	err = Main([]string{"juicefs", "sync", "file:///tmp/src", "file:///tmp/dst", "--manager", "127.0.0.1:1"})
+	if err == nil || !strings.Contains(err.Error(), "load worker config") {
+		t.Fatalf("worker should read config from stdin without an extra flag: %v", err)
+	}
+}
+
+func TestSyncWorkerRestoresUmaskBeforeConfigInitialization(t *testing.T) {
+	oldUmask := utils.GetUmask()
+	t.Cleanup(func() { utils.SetUmask(oldUmask) })
+	utils.SetUmask(0022)
+	t.Setenv(juicesync.JFS_UMASK, "")
+
+	stdin := filepath.Join(t.TempDir(), "stdin")
+	payload := `{
+		"source": "invalid://bucket/",
+		"destination": "file:///tmp/dst/",
+		"env": {"JFS_UMASK": "63"}
+	}`
+	if err := os.WriteFile(stdin, []byte(payload), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(stdin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	oldStdin := os.Stdin
+	os.Stdin = f
+	t.Cleanup(func() { os.Stdin = oldStdin })
+
+	if err = Main([]string{"juicefs", "sync", "invalid://bucket/", "file:///tmp/dst/", "--manager", "127.0.0.1:1"}); err == nil {
+		t.Fatal("expected unsupported storage error")
+	}
+	if got := utils.GetUmask(); got != 0077 {
+		t.Fatalf("worker umask was not restored before config initialization: %04o", got)
+	}
+}
+
+func TestCreateSyncStorageSwiftPathStyle(t *testing.T) {
+	var authed []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/auth/v1.0" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		authed = append(authed, r.Header.Get("X-Auth-User"))
+		w.Header().Set("X-Storage-Url", "http://"+r.Host+"/v1/AUTH_test")
+		w.Header().Set("X-Auth-Token", "tk")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	host := strings.TrimPrefix(srv.URL, "http://")
+	conf := &juicesync.Config{NoHTTPS: true}
+	for _, c := range []struct{ uri, want string }{
+		{"swift://u:p@" + host + "/me%40example.com/a/b/?path-style=true", "swift://me@example.com/a/b/"},
+		{"swift://u:p@" + host + "/me%40example.com?path-style=true", "swift://me@example.com/"},
+		{"swift://u:p@" + host + "/a%25b%3Fc/x/?path-style=true", "swift://a%b?c/x/"},
+	} {
+		store, err := createSyncStorage(c.uri, conf)
+		if err != nil {
+			t.Fatalf("%s: %s", c.uri, err)
+		}
+		if store.String() != c.want {
+			t.Errorf("%s: got %s, want %s", c.uri, store.String(), c.want)
+		}
+	}
+	if _, err := createSyncStorage("swift://u:p@"+host+"/?path-style=true", conf); err == nil {
+		t.Error("expected an error for a path-style URL without a container")
+	}
+	if len(authed) != 3 || authed[0] != "u" {
+		t.Errorf("unexpected auth requests: %v", authed)
+	}
+
+	for uri, want := range map[string]bool{
+		"swift://u:p@host/c/dir/?path-style=true":    true,
+		"swift://u:p@host/c/dir?path-style=true":     false,
+		"swift://c.host/?auth-url=https://k:5000/v3": true,
+		"swift://c.host?auth-url=https://k:5000/v3":  false,
+		"s3://bucket/prefix/":                        true,
+		"s3://bucket/prefix":                         false,
+		"/tmp/dir/":                                  true,
+		"/tmp/dir":                                   false,
+	} {
+		if got := hasTrailingSlash(uri); got != want {
+			t.Errorf("hasTrailingSlash(%s) = %v, want %v", uri, got, want)
+		}
+	}
+}

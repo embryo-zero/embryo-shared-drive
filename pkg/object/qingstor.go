@@ -1,0 +1,333 @@
+//go:build !noqingstor
+// +build !noqingstor
+
+/*
+ * JuiceFS, Copyright 2018 Juicedata, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package object
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+
+	"github.com/juicedata/juicefs/pkg/utils"
+	"github.com/qingstor/qingstor-sdk-go/v4/config"
+	"github.com/qingstor/qingstor-sdk-go/v4/request/errors"
+	qs "github.com/qingstor/qingstor-sdk-go/v4/service"
+)
+
+type qingstor struct {
+	bucket *qs.Bucket
+	tierStorage
+}
+
+func (q *qingstor) String() string {
+	return fmt.Sprintf("qingstor://%s/", *q.bucket.Properties.BucketName)
+}
+
+func (q *qingstor) Limits() Limits {
+	return Limits{
+		IsSupportMultipartUpload: true,
+		IsSupportUploadPartCopy:  true,
+		MinPartSize:              4 << 20,
+		MaxPartSize:              5 << 30,
+		MaxPartCount:             10000,
+	}
+}
+
+func (q *qingstor) Create(ctx context.Context) error {
+	_, err := q.bucket.PutWithContext(ctx)
+	if err != nil && strings.Contains(err.Error(), "bucket_already_exists") {
+		err = nil
+	}
+	return err
+}
+
+func (q *qingstor) Head(ctx context.Context, key string) (Object, error) {
+	r, err := q.bucket.HeadObjectWithContext(ctx, key, nil)
+	if err != nil {
+		if e, ok := err.(*errors.QingStorError); ok && e.StatusCode == http.StatusNotFound {
+			return nil, os.ErrNotExist
+		}
+		return nil, err
+	}
+	return &obj{
+		key,
+		aws.ToInt64(r.ContentLength),
+		aws.ToTime(r.LastModified),
+		strings.HasSuffix(key, "/"),
+		aws.ToString(r.XQSStorageClass),
+		"",
+	}, nil
+}
+
+func (q *qingstor) Get(ctx context.Context, key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
+	input := &qs.GetObjectInput{}
+	rangeStr := getRange(off, limit)
+	if rangeStr != "" {
+		input.Range = &rangeStr
+	}
+	output, err := q.bucket.GetObjectWithContext(ctx, key, input)
+	if output != nil {
+		attrs := ApplyGetters(getters...)
+		attrs.SetRequestID(aws.ToString(output.RequestID))
+		if output.XQSStorageClass != nil {
+			attrs.SetStorageClass(*output.XQSStorageClass)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err = checkGetStatus(*output.StatusCode, rangeStr != ""); err != nil {
+		_ = output.Body.Close()
+		return nil, err
+	}
+	return output.Body, nil
+}
+func (q *qingstor) Restore(ctx context.Context, key string, days int32) error {
+	return notSupported
+}
+
+func (q *qingstor) Put(ctx context.Context, key string, in io.Reader, getters ...AttrGetter) error {
+	body, vlen, err := findLen(in)
+	if err != nil {
+		return err
+	}
+	mimeType := utils.GuessMimeType(key)
+	input := &qs.PutObjectInput{
+		Body:          body,
+		ContentLength: &vlen,
+		ContentType:   &mimeType,
+	}
+	t := q.GetTier(ctx)
+	if t.Sc != "" {
+		// XQSStorageClass's available values: STANDARD, STANDARD_IA
+		input.XQSStorageClass = &t.Sc
+	}
+	// todo: The lifecycle rules of qingstor do not support filtering using tags
+	out, err := q.bucket.PutObjectWithContext(ctx, key, input)
+	if out != nil {
+		attrs := ApplyGetters(getters...)
+		attrs.SetRequestID(aws.ToString(out.RequestID)).SetStorageClass(t.Sc)
+	}
+	if err != nil {
+		return err
+	}
+	if code := aws.ToInt(out.StatusCode); code != 201 {
+		return fmt.Errorf("unexpected code: %d", code)
+	}
+	return nil
+}
+
+func (q *qingstor) Copy(ctx context.Context, dst, src string) error {
+	sc := getOrDefaultScValue(q.GetTier(ctx).Sc, DefaultStorageClass)
+	source := "/" + encodeCopySource(*q.bucket.Properties.BucketName, src)
+	input := &qs.PutObjectInput{
+		XQSCopySource:   &source,
+		XQSStorageClass: &sc,
+	}
+	out, err := q.bucket.PutObjectWithContext(ctx, dst, input)
+	if err != nil {
+		return err
+	}
+	if code := aws.ToInt(out.StatusCode); code != 201 {
+		return fmt.Errorf("unexpected code: %d", code)
+	}
+	return nil
+}
+
+func (q *qingstor) Delete(ctx context.Context, key string, getters ...AttrGetter) error {
+	output, err := q.bucket.DeleteObjectWithContext(ctx, key)
+	if output != nil {
+		attrs := ApplyGetters(getters...)
+		attrs.SetRequestID(aws.ToString(output.RequestID))
+	}
+	return err
+}
+
+func (q *qingstor) List(ctx context.Context, prefix, start, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
+	if limit > 1000 {
+		limit = 1000
+	}
+	limit_ := int(limit)
+	input := &qs.ListObjectsInput{
+		Prefix: &prefix,
+		Marker: &start,
+		Limit:  &limit_,
+	}
+	if delimiter != "" {
+		input.Delimiter = &delimiter
+	}
+	out, err := q.bucket.ListObjectsWithContext(ctx, input)
+	if err != nil {
+		return nil, false, "", err
+	}
+	n := len(out.Keys)
+	objs := make([]Object, n)
+	for i := 0; i < n; i++ {
+		k := out.Keys[i]
+		oKey := aws.ToString(k.Key)
+		objs[i] = &obj{
+			oKey,
+			aws.ToInt64(k.Size),
+			time.Unix(int64(aws.ToInt(k.Modified)), 0),
+			strings.HasSuffix(oKey, "/"),
+			aws.ToString(k.StorageClass),
+			"",
+		}
+	}
+	if delimiter != "" {
+		for _, p := range out.CommonPrefixes {
+			objs = append(objs, &obj{aws.ToString(p), 0, time.Unix(0, 0), true, "", ""})
+		}
+		sort.Slice(objs, func(i, j int) bool { return objs[i].Key() < objs[j].Key() })
+	}
+	return objs, aws.ToBool(out.HasMore), aws.ToString(out.NextMarker), nil
+}
+
+func (q *qingstor) ListAll(ctx context.Context, prefix, marker string, followLink bool) (<-chan Object, error) {
+	return nil, notSupported
+}
+
+func (q *qingstor) CreateMultipartUpload(ctx context.Context, key string) (*MultipartUpload, error) {
+	var input qs.InitiateMultipartUploadInput
+	if sc := q.tiers[0].Sc; sc != "" {
+		input.XQSStorageClass = &sc
+	}
+	r, err := q.bucket.InitiateMultipartUploadWithContext(ctx, key, &input)
+	if err != nil {
+		return nil, err
+	}
+	uploadID := aws.ToString(r.UploadID)
+	if uploadID == "" {
+		return nil, fmt.Errorf("qingstor: InitiateMultipartUpload returned empty UploadID for %s", key)
+	}
+	return &MultipartUpload{UploadID: uploadID, MinPartSize: 4 << 20, MaxCount: 10000}, nil
+}
+
+func (q *qingstor) UploadPart(ctx context.Context, key string, uploadID string, num int, data []byte) (*Part, error) {
+	input := &qs.UploadMultipartInput{
+		UploadID:   &uploadID,
+		PartNumber: &num,
+		Body:       bytes.NewReader(data),
+	}
+	r, err := q.bucket.UploadMultipartWithContext(ctx, key, input)
+	if err != nil {
+		return nil, err
+	}
+	return &Part{Num: num, Size: len(data), ETag: strings.Trim(aws.ToString(r.ETag), "\"")}, nil
+}
+
+func (q *qingstor) UploadPartCopy(ctx context.Context, key string, uploadID string, num int, srcKey string, off, size int64) (*Part, error) {
+	input := &qs.UploadMultipartInput{
+		UploadID:      &uploadID,
+		PartNumber:    &num,
+		XQSCopySource: aws.String("/" + encodeCopySource(*q.bucket.Properties.BucketName, srcKey)),
+		XQSCopyRange:  aws.String(fmt.Sprintf("bytes=%d-%d", off, off+size-1)),
+	}
+	r, err := q.bucket.UploadMultipartWithContext(ctx, key, input)
+	if err != nil {
+		return nil, err
+	}
+	return &Part{Num: num, Size: int(size), ETag: strings.Trim(aws.ToString(r.ETag), "\"")}, nil
+}
+
+func (q *qingstor) AbortUpload(ctx context.Context, key string, uploadID string) {
+	input := &qs.AbortMultipartUploadInput{
+		UploadID: &uploadID,
+	}
+	_, _ = q.bucket.AbortMultipartUploadWithContext(ctx, key, input)
+}
+
+func (q *qingstor) CompleteUpload(ctx context.Context, key string, uploadID string, parts []*Part) error {
+	oparts := make([]*qs.ObjectPartType, len(parts))
+	for i := range parts {
+		oparts[i] = &qs.ObjectPartType{
+			PartNumber: &parts[i].Num,
+			Etag:       &parts[i].ETag,
+		}
+	}
+	input := &qs.CompleteMultipartUploadInput{
+		UploadID:    &uploadID,
+		ObjectParts: oparts,
+	}
+	_, err := q.bucket.CompleteMultipartUploadWithContext(ctx, key, input)
+	return err
+}
+
+func (q *qingstor) ListUploads(ctx context.Context, marker string) ([]*PendingPart, string, error) {
+	input := &qs.ListMultipartUploadsInput{
+		KeyMarker: &marker,
+	}
+	result, err := q.bucket.ListMultipartUploadsWithContext(ctx, input)
+	if err != nil {
+		return nil, "", err
+	}
+	parts := make([]*PendingPart, len(result.Uploads))
+	for i, u := range result.Uploads {
+		parts[i] = &PendingPart{aws.ToString(u.Key), aws.ToString(u.UploadID), aws.ToTime(u.Created)}
+	}
+	return parts, aws.ToString(result.NextKeyMarker), nil
+}
+
+func newQingStor(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) {
+	if !strings.Contains(endpoint, "://") {
+		endpoint = fmt.Sprintf("https://%s", endpoint)
+	}
+	uri, err := url.ParseRequestURI(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("Invalid endpoint: %v, error: %v", endpoint, err)
+	}
+	var bucketName, zone, host string
+	if !strings.HasSuffix(uri.Host, "qingstor.com") {
+		// support private cloud
+		hostParts := strings.SplitN(uri.Host, ".", 2)
+		bucketName, zone, host = hostParts[0], "", hostParts[1]
+	} else {
+		hostParts := strings.SplitN(uri.Host, ".", 3)
+		bucketName, zone, host = hostParts[0], hostParts[1], hostParts[2]
+	}
+	conf, err := config.New(accessKey, secretKey)
+	if err != nil {
+		return nil, fmt.Errorf("Can't load config: %s", err.Error())
+	}
+	conf.Host = host
+	conf.Protocol = uri.Scheme
+	conf.AdditionalUserAgent = UserAgent
+	if uri.Scheme == "http" {
+		conf.Port = 80
+	} else {
+		conf.Port = 443
+	}
+	conf.Connection = httpClient
+	qsService, _ := qs.Init(conf)
+	bucket, _ := qsService.Bucket(bucketName, zone)
+	return &qingstor{bucket: bucket}, nil
+}
+
+func init() {
+	Register("qingstor", newQingStor)
+}
